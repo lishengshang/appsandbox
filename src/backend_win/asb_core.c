@@ -894,13 +894,13 @@ static BOOL allocate_nat_ip(VmInstance *vm)
 static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
                                        wchar_t *ep_guid_str, size_t str_len,
                                        char *nat_ip, size_t nat_ip_size,
-                                       BOOL is_nat)
+                                       BOOL is_nat, const wchar_t *vm_name)
 {
     HRESULT hr;
     int retry;
 
     hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len,
-                              (nat_ip && nat_ip[0]) ? nat_ip : NULL);
+                              (nat_ip && nat_ip[0]) ? nat_ip : NULL, vm_name);
     if (SUCCEEDED(hr) || !is_nat || !nat_ip || !nat_ip[0]) return hr;
 
     asb_log(L"Endpoint failed for %S, trying next IP...", nat_ip);
@@ -909,7 +909,7 @@ static HRESULT try_endpoint_with_retry(const GUID *net_id, GUID *ep_id,
         if (sscanf_s(nat_ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4 || d >= 254) break;
         sprintf_s(nat_ip, nat_ip_size, "%d.%d.%d.%d", a, b, c, d + 1);
         asb_log(L"Retrying with %S...", nat_ip);
-        hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len, nat_ip);
+        hr = hcn_create_endpoint(net_id, ep_id, ep_guid_str, str_len, nat_ip, vm_name);
         if (SUCCEEDED(hr)) return hr;
     }
     return hr;
@@ -955,7 +955,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           endpoint_guid_str, 64,
                                           vm->nat_ip, sizeof(vm->nat_ip),
-                                          args->network_mode == NET_NAT);
+                                          args->network_mode == NET_NAT,
+                                          args->vm->name);
             if (SUCCEEDED(hr) && args->network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Error: Network endpoint failed (0x%08X).", hr);

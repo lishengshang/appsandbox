@@ -54,10 +54,15 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
    endpoint_guid_str: output string representation of endpoint GUID (for HCS JSON).
    nat_ip: for NAT networks, the static IP to assign (e.g. "172.20.0.2"); if
            NULL/empty, NAT endpoints default to "172.20.0.2". Ignored for
-           Internal and External networks (which always use DHCP). */
+           Internal and External networks (which always use DHCP).
+   vm_name: used to derive a STABLE MAC address for the endpoint ("02:xx:xx:xx:xx:xx").
+            Without it HCN assigns a fresh random MAC on every boot, so the
+            guest NIC changes identity each power cycle and DHCP reservations /
+            static-IP setups in routers break (issue #92). Pass NULL/empty to
+            keep the old random-MAC behavior. */
 HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
                             wchar_t *endpoint_guid_str, size_t str_len,
-                            const char *nat_ip);
+                            const char *nat_ip, const wchar_t *vm_name);
 
 /* Delete a network by GUID. */
 ASB_API HRESULT hcn_delete_network(const GUID *network_id);

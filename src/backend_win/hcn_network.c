@@ -435,13 +435,37 @@ HRESULT hcn_create_external_network(GUID *network_id, const wchar_t *adapter_nam
     return hr;
 }
 
+/* Derive a stable, locally-administered MAC address from a VM name
+   ("02:xx:xx:xx:xx:xx"). HCN otherwise assigns a random MAC per endpoint,
+   so the guest NIC changes identity on every power cycle and DHCP
+   reservations / static IPs in routers stop matching (issue #92). */
+static void stable_mac_from_name(const wchar_t *name, wchar_t *mac, size_t mac_sz)
+{
+    unsigned long hash = 2166136261UL;  /* FNV-1a 32-bit */
+
+    mac[0] = L'\0';
+    if (!name || !name[0]) return;
+
+    for (const wchar_t *p = name; *p; p++) {
+        hash ^= (unsigned char)(*p & 0xFF);
+        hash *= 16777619UL;
+        hash ^= (unsigned char)((*p >> 8) & 0xFF);
+        hash *= 16777619UL;
+    }
+    swprintf_s(mac, mac_sz, L"02:%02x:%02x:%02x:%02x:%02x",
+               (hash >> 24) & 0xFF, (hash >> 16) & 0xFF,
+               (hash >> 8) & 0xFF, hash & 0xFF,
+               ((hash >> 5) ^ hash) & 0xFF);
+}
+
 HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
                             wchar_t *endpoint_guid_str, size_t str_len,
-                            const char *nat_ip)
+                            const char *nat_ip, const wchar_t *vm_name)
 {
     wchar_t net_guid_str[64];
     wchar_t ep_guid_str[64];
     wchar_t settings[1024];
+    wchar_t mac_str[32] = { 0 };
     void *network = NULL;
     void *endpoint = NULL;
     PWSTR error_record = NULL;
@@ -459,29 +483,63 @@ HRESULT hcn_create_endpoint(const GUID *network_id, GUID *endpoint_id,
     guid_to_string(network_id, net_guid_str, 64);
     guid_to_string(endpoint_id, ep_guid_str, 64);
 
+    stable_mac_from_name(vm_name, mac_str, sizeof(mac_str) / sizeof(mac_str[0]));
+
     /* Static IP for NAT; DHCP for Internal (ICS) and External (Transparent) */
     if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID) && nat_ip && nat_ip[0]) {
-        swprintf_s(settings, 1024,
-            L"{"
-            L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-            L"\"HostComputeNetwork\":\"%s\","
-            L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}]"
-            L"}", net_guid_str, nat_ip);
+        if (mac_str[0]) {
+            swprintf_s(settings, 1024,
+                L"{"
+                L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+                L"\"HostComputeNetwork\":\"%s\","
+                L"\"MacAddress\":\"%s\","
+                L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}]"
+                L"}",
+                net_guid_str, mac_str, nat_ip);
+        } else {
+            swprintf_s(settings, 1024,
+                L"{"
+                L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+                L"\"HostComputeNetwork\":\"%s\","
+                L"\"IpConfigurations\":[{\"IpAddress\":\"%S\",\"PrefixLength\":24}]"
+                L"}", net_guid_str, nat_ip);
+        }
     } else if (IsEqualGUID(network_id, &APPSANDBOX_NAT_GUID)) {
         pick_nat_base_once();
-        swprintf_s(settings, 1024,
-            L"{"
-            L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-            L"\"HostComputeNetwork\":\"%s\","
-            L"\"IpConfigurations\":[{\"IpAddress\":\"%S.2\",\"PrefixLength\":24}]"
-            L"}", net_guid_str, g_nat_base);
+        if (mac_str[0]) {
+            swprintf_s(settings, 1024,
+                L"{"
+                L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+                L"\"HostComputeNetwork\":\"%s\","
+                L"\"MacAddress\":\"%s\","
+                L"\"IpConfigurations\":[{\"IpAddress\":\"%S.2\",\"PrefixLength\":24}]"
+                L"}",
+                net_guid_str, mac_str, g_nat_base);
+        } else {
+            swprintf_s(settings, 1024,
+                L"{"
+                L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+                L"\"HostComputeNetwork\":\"%s\","
+                L"\"IpConfigurations\":[{\"IpAddress\":\"%S.2\",\"PrefixLength\":24}]"
+                L"}", net_guid_str, g_nat_base);
+        }
     } else {
         /* Internal (ICS DHCP) or External (LAN DHCP) - no static IP */
-        swprintf_s(settings, 1024,
-            L"{"
-            L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
-            L"\"HostComputeNetwork\":\"%s\""
-            L"}", net_guid_str);
+        if (mac_str[0]) {
+            swprintf_s(settings, 1024,
+                L"{"
+                L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+                L"\"HostComputeNetwork\":\"%s\","
+                L"\"MacAddress\":\"%s\""
+                L"}",
+                net_guid_str, mac_str);
+        } else {
+            swprintf_s(settings, 1024,
+                L"{"
+                L"\"SchemaVersion\":{\"Major\":2,\"Minor\":0},"
+                L"\"HostComputeNetwork\":\"%s\""
+                L"}", net_guid_str);
+        }
     }
 
     hr = pfnCreateEp(network, endpoint_id, settings, &endpoint, &error_record);
