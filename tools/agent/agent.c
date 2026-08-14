@@ -23,6 +23,7 @@
 #include <cfgmgr32.h>
 #include <wtsapi32.h>
 #include <userenv.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include "p9copy.h"
@@ -34,6 +35,41 @@
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+/* Resolve the guest's primary NIC as a locale-independent interface index.
+   netsh accepts the index anywhere it accepts the adapter name, so we never
+   have to guess the localized name ("Ethernet" is only English; French,
+   Korean, Japanese... guests name it differently). Falls back to -1 so
+   callers can keep the old hardcoded name as a last resort. */
+static int primary_nic_index(void)
+{
+    static int cached = -2;
+    ULONG size = 0;
+    IP_ADAPTER_ADDRESSES *addrs;
+
+    if (cached != -2) return cached;
+    cached = -1;
+
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, NULL, &size) != ERROR_BUFFER_OVERFLOW ||
+        size == 0)
+        return cached;
+    addrs = (IP_ADAPTER_ADDRESSES *)malloc(size);
+    if (!addrs) return cached;
+    if (GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addrs, &size) == ERROR_SUCCESS) {
+        for (IP_ADAPTER_ADDRESSES *a = addrs; a; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp) continue;
+            if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+                a->IfType == IF_TYPE_TUNNEL)
+                continue;
+            if (!a->FirstUnicastAddress) continue;
+            cached = (int)a->IfIndex;
+            break;
+        }
+    }
+    free(addrs);
+    return cached;
+}
 
 /* GUID_DEVCLASS_DISPLAY = {4D36E968-E325-11CE-BFC1-08002BE10318} */
 static const GUID GUID_DISPLAY_CLASS =
@@ -1964,9 +2000,26 @@ static void handle_client(AsbConn *client)
                 STARTUPINFOW si;
                 PROCESS_INFORMATION pi;
                 DWORD exit_code = 1;
+                const wchar_t *nic_arg;
+                wchar_t nic_index_buf[24];
+                int nic_index = primary_nic_index();
+
+                /* Target the NIC by interface index (locale-independent)
+                   instead of the hardcoded English name "Ethernet", which
+                   does not exist on localized guests (e.g. "이더넷" on
+                   Korean Windows) and broke NAT IP assignment (#79/#84).
+                   The index is preferred; fall back to the old name only
+                   if enumeration failed. */
+                if (nic_index > 0) {
+                    swprintf_s(nic_index_buf, sizeof(nic_index_buf) / sizeof(nic_index_buf[0]), L"%d", nic_index);
+                    nic_arg = nic_index_buf;
+                } else {
+                    nic_arg = L"Ethernet";
+                }
 
                 swprintf_s(wcmd, 512,
-                    L"netsh interface ip set address \"Ethernet\" static %S %S %S",
+                    L"netsh interface ip set address name=%s static %S %S %S",
+                    nic_arg,
                     ip,
                     /* Convert prefix length to subnet mask */
                     atoi(prefix) == 16 ? "255.255.0.0" :
@@ -1995,7 +2048,7 @@ static void handle_client(AsbConn *client)
                     PROCESS_INFORMATION pi2;
 
                     swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip set dns \"Ethernet\" static %S", gateway);
+                        L"netsh interface ip set dns name=%s static %S", nic_arg, gateway);
                     ZeroMemory(&si2, sizeof(si2));
                     si2.cb = sizeof(si2);
                     ZeroMemory(&pi2, sizeof(pi2));
@@ -2007,7 +2060,7 @@ static void handle_client(AsbConn *client)
                     }
 
                     swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip add dns \"Ethernet\" 8.8.8.8 index=2");
+                        L"netsh interface ip add dns name=%s 8.8.8.8 index=2", nic_arg);
                     ZeroMemory(&si2, sizeof(si2));
                     si2.cb = sizeof(si2);
                     ZeroMemory(&pi2, sizeof(pi2));
