@@ -196,6 +196,12 @@ int main(void)
 {
     AsbListener *l;
 
+    /* Cursor clicks landed at the wrong position when the guest display
+       scaling was not 100%: GetCursorPos returns physical pixels while the
+       input mapping assumed logical ones. Make the process per-monitor DPI
+       aware so the two match (upstream PR #111). */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     input_log("Starting (PID=%lu, session=%lu).",
               GetCurrentProcessId(),
               WTSGetActiveConsoleSessionId());
