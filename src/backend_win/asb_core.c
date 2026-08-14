@@ -465,7 +465,11 @@ static void save_vm_list(void)
 
     get_config_path(path, MAX_PATH);
 
-    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    /* ccs=UTF-8: vms.cfg can hold non-ASCII values (e.g. a localized host
+       network adapter name like "イーサネット"). Without it, fwprintf
+       converts wide chars to the ANSI codepage and names get mangled on
+       disk, breaking e.g. External network mode (issue #94). */
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
 
     if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
         fwprintf(f, L"[Settings]\n");
@@ -528,7 +532,7 @@ static void load_vm_list(void)
     BOOL in_settings = FALSE;
 
     get_config_path(path, MAX_PATH);
-    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f) return;
 
     while (fgetws(line, 1024, f)) {
         size_t len = wcslen(line);
