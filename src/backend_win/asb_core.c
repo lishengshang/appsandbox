@@ -1254,7 +1254,7 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
                               ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat);
+                                          nat_ip, ip_size, is_nat, args->config.name);
             if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
                 if (is_nat) save_vm_list();
@@ -2349,7 +2349,7 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                               ? sizeof(g_vms[args->vm_index].nat_ip) : 0;
             hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
                                           args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat);
+                                          nat_ip, ip_size, is_nat, args->config.name);
             if (SUCCEEDED(hr)) {
                 args->has_network = TRUE;
                 if (is_nat) save_vm_list();
@@ -3090,7 +3090,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             hr = try_endpoint_with_retry(&inst->network_id, &inst->endpoint_id,
                                           endpoint_guid_str, 64,
                                           inst->nat_ip, sizeof(inst->nat_ip),
-                                          cfg.network_mode == NET_NAT);
+                                          cfg.network_mode == NET_NAT, inst->name);
             if (SUCCEEDED(hr) && cfg.network_mode == NET_NAT) save_vm_list();
             if (FAILED(hr)) {
                 asb_log(L"Warning: Endpoint failed (0x%08X).", hr);
