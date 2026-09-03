@@ -1579,11 +1579,28 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "        zstd -d \"$EXTRAS/wsl-mesa.tar.zst\" -c | tar -C / -x \\\n"
         "          && echo \"OK: wsl-mesa extracted to /opt/wsl-mesa\" \\\n"
         "          || echo \"FAIL: wsl-mesa extract\"\n"
-        "        echo /opt/wsl-mesa/lib/" IP_MULTIARCH_A " > /etc/ld.so.conf.d/wsl-mesa.conf\n"
-        "        install -d /etc/vulkan/icd.d\n"
-        "        if [ -f /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " ]; then\n"
-        "            ln -sf /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " \\\n"
-        "                   /etc/vulkan/icd.d/" IP_DZN_ICD_A "\n"
+        "        # The prebuilt is tied to the release it was built on (26.04:\n"
+        "        # Mesa 25.3 against LLVM 21). Putting it on ld.so.conf shadows the\n"
+        "        # distro Mesa for every process, so if its libraries do not\n"
+        "        # resolve here mutter cannot even create a GBM device and the\n"
+        "        # desktop never comes up (black display). Check before activating;\n"
+        "        # on a mismatch drop it and stay on stock Mesa, whose own d3d12\n"
+        "        # driver still gives OpenGL apps the host GPU (see 50-appsandbox-gpu).\n"
+        "        MISSING=$(ldd /opt/wsl-mesa/lib/" IP_MULTIARCH_A "/libgallium-*.so \\\n"
+        "                      /opt/wsl-mesa/lib/" IP_MULTIARCH_A "/libgbm.so.1 2>/dev/null \\\n"
+        "                  | grep 'not found' | awk '{print $1}' | sort -u | tr '\\n' ' ')\n"
+        "        if [ -n \"$MISSING\" ]; then\n"
+        "            echo \"WARN: wsl-mesa prebuilt needs libraries this release lacks: $MISSING\"\n"
+        "            echo \"WARN: removing /opt/wsl-mesa - desktop + apps use the distro Mesa\"\n"
+        "            rm -rf /opt/wsl-mesa\n"
+        "            rm -f /etc/ld.so.conf.d/wsl-mesa.conf\n"
+        "        else\n"
+        "            echo /opt/wsl-mesa/lib/" IP_MULTIARCH_A " > /etc/ld.so.conf.d/wsl-mesa.conf\n"
+        "            install -d /etc/vulkan/icd.d\n"
+        "            if [ -f /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " ]; then\n"
+        "                ln -sf /opt/wsl-mesa/share/vulkan/icd.d/" IP_DZN_ICD_A " \\\n"
+        "                       /etc/vulkan/icd.d/" IP_DZN_ICD_A "\n"
+        "            fi\n"
         "        fi\n"
         "    fi\n"
         "else\n"
@@ -1782,6 +1799,26 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "echo \"  keyboard: $(grep -h XKBLAYOUT /etc/default/keyboard 2>/dev/null | head -1)\"\n"
         "echo \"  timezone: $(cat /etc/timezone 2>/dev/null)\"\n"
         "set -x\n"
+        "\n"
+        "# --- STEP 98: ext4 journal for / ---\n"
+        "# iso-patch's ext4 writer lays the root fs down without a journal. That\n"
+        "# is fine for the build, but an unclean stop of the running VM (Force\n"
+        "# Stop, host crash) then needs a full fsck, and a journal-less fs is\n"
+        "# far more likely to end up 'not clean with errors' and stall the next\n"
+        "# boot at a maintenance prompt. tune2fs can add the journal to the\n"
+        "# mounted root (it lands as a regular file and is adopted by the kernel\n"
+        "# on the next mount). fsck.repair=yes on the cmdline covers the rest.\n"
+        "echo \"==== STEP 98: ext4 journal on / ====\"\n"
+        "ROOTDEV=$(findmnt -n -o SOURCE / 2>/dev/null)\n"
+        "if [ -b \"$ROOTDEV\" ] && ! tune2fs -l \"$ROOTDEV\" 2>/dev/null | grep -q has_journal; then\n"
+        "    if tune2fs -O has_journal \"$ROOTDEV\" 2>&1 | tail -3; then\n"
+        "        echo \"OK: journal added to $ROOTDEV\"\n"
+        "    else\n"
+        "        echo \"WARN: tune2fs -O has_journal $ROOTDEV failed (rc=$?)\"\n"
+        "    fi\n"
+        "else\n"
+        "    echo \"SKIP STEP 98: $ROOTDEV already has a journal (or not a block device)\"\n"
+        "fi\n"
         "\n"
         "# --- STEP 99: Mark done + reboot ---\n"
         "echo \"==== STEP 99: mark done + reboot ====\"\n"
@@ -2469,7 +2506,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
             "    insmod part_gpt\n"
             "    insmod ext2\n"
             "    set root='hd0,gpt2'\n"
-            "    linux  /boot/vmlinuz-%s root=UUID=%s ro%s"
+            "    linux  /boot/vmlinuz-%s root=UUID=%s ro%s fsck.repair=yes"
             " " IP_EARLYCON_A "console=tty0 console=" IP_SERIAL_A ",115200\n"
             "    initrd /boot/initrd.img-%s\n"
             "}\n",
@@ -2482,6 +2519,25 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         ext4_writer_add_file(ew, "/boot/grub/grub.cfg", 0644, 0, 0,
                              (uint32_t)time(NULL),
                              boot_cfg, strlen(boot_cfg));
+    }
+
+    /* ---- Step 8b: keep the boot resilient after unclean stops.
+       update-grub in the guest regenerates grub.cfg from /etc/default/grub
+       + grub.d, so the bootstrap cmdline alone would lose fsck.repair=yes
+       on the second boot. ---- */
+    {
+        static const char dropin[] =
+            "# Written by AppSandbox iso-patch. The root ext4 is created by iso-patch's\n"
+            "# own ext4 writer, i.e. without a journal (first boot adds one), so an\n"
+            "# unclean stop (Force Stop, host crash) can leave it needing a full fsck.\n"
+            "# Let the boot-time fsck repair it automatically instead of dropping to a\n"
+            "# maintenance prompt nobody can see, and do not sit at the GRUB menu\n"
+            "# indefinitely after such a boot.\n"
+            "GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX fsck.repair=yes\"\n"
+            "GRUB_RECORDFAIL_TIMEOUT=5\n";
+        ext4_mkdir_p(ew, "/etc/default/grub.d");
+        ext4_writer_add_file(ew, "/etc/default/grub.d/91-appsandbox-resilient-boot.cfg",
+                             0644, 0, 0, (uint32_t)time(NULL), dropin, sizeof(dropin) - 1);
     }
 
     /* ---- Step 9: First-boot service. ---- */
