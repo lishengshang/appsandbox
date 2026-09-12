@@ -100,6 +100,17 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
     swprintf_s(dst, MAX_PATH, L"%s\\nvapi64_proxy.dll", dir);
     CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the proxy */
 
+    /* Native Vulkan ICD shim for NVIDIA GPU-PV guests (tools/nvvk-shim). Rides
+     * the same share; the agent drops it next to nvoglv64.dll in the guest's
+     * HostDriverStore and points nv-vk64.json at it, so Vulkan games get
+     * NVIDIA's driver instead of Mesa's Vulkan-on-D3D12. See nvvk_shim_provision(). */
+    swprintf_s(res, MAX_PATH, L"%s\\resources\\nvvk-shim", exe);
+    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
+        swprintf_s(res, MAX_PATH, L"%s\\nvvk-shim", exe);
+    swprintf_s(src, MAX_PATH, L"%s\\asb_nvvk.dll", res);
+    swprintf_s(dst, MAX_PATH, L"%s\\asb_nvvk.dll", dir);
+    CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the shim */
+
     gpu_append_gl_layers_share(shares, dir);
 }
 
