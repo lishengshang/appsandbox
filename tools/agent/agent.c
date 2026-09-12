@@ -594,7 +594,6 @@ static BOOL replace_system_dll(const wchar_t *sys, const wchar_t *src, const wch
     return TRUE;
 }
 
-<<<<<<< HEAD
 /* NVIDIA's nvapi64.dll as shipped by the active display driver: the
    HostDriverStore directory that also carries nvapi64_impl.dll (a guest keeps
    the directories of earlier drivers around; the newest one wins). */
