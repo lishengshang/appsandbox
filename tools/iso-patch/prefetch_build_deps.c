@@ -317,6 +317,39 @@ cleanup_sess: WinHttpCloseHandle(hSession);
     return rc;
 }
 
+/* http_download with retries: direct connections to archive.ubuntu.com
+   are frequently flaky (especially from APAC networks), and a single
+   transient failure currently aborts the whole prefetch. 3 attempts,
+   3 s apart. */
+static int http_download_retry(const wchar_t *url, const wchar_t *dst, int attempts)
+{
+    for (int i = 1; ; i++) {
+        if (http_download(url, dst) == 0) return 0;
+        if (i >= attempts) return -1;
+        log_msg(L"prefetch: download failed (attempt %d/%d), retrying: %s", i, attempts, url);
+        Sleep(3000);
+    }
+}
+
+/* Slurp a whole file into a malloc'd buffer (caller frees). */
+static char *slurp_bin(const wchar_t *path, size_t *out_len)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return NULL; }
+    char *buf = (char *)malloc((size_t)sz.QuadPart + 1);
+    if (!buf) { CloseHandle(h); return NULL; }
+    DWORD br = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sz.QuadPart, &br, NULL);
+    CloseHandle(h);
+    if (!ok || (size_t)br != (size_t)sz.QuadPart) { free(buf); return NULL; }
+    buf[sz.QuadPart] = 0;
+    *out_len = (size_t)sz.QuadPart;
+    return buf;
+}
+
 /* ====================================================================
  * SHA256 via BCrypt — verify the .debs against Packages metadata.
  * ==================================================================== */
@@ -699,43 +732,66 @@ int do_prefetch_build_deps(const wchar_t *codename,
     u_mkdir_p(out_dir);
     const wchar_t *staging = out_dir;
 
-    /* ---- 1. Download Packages.xz ---- */
-    wchar_t pkgs_xz[MAX_PATH], pkgs[MAX_PATH];
-    swprintf_s(pkgs_xz, MAX_PATH, L"%s\\Packages.xz", staging);
-    swprintf_s(pkgs,    MAX_PATH, L"%s\\Packages",    staging);
-
+    /* ---- 1-3. Download, decompress, slurp + parse both pockets.
+       The release pocket alone is required; -updates is merged when
+       available: point-release ISOs (e.g. 26.04.1) ship their kernel
+       from -updates, so linux-headers-<kver> only exists there. The
+       two texts are concatenated [release, updates] and parsed once —
+       the hash chains are head-inserted, so for a package present in
+       both pockets lookup_pkg returns the (newer) updates record and
+       the stale release stanza never enters the closure. */
     wchar_t url[1024];
+    size_t rel_len = 0, upd_len = 0, off = 0;
+    char *rel = NULL, *upd = NULL;
+    wchar_t tmp_xz[MAX_PATH], tmp_pkgs[MAX_PATH];
+
+    swprintf_s(tmp_xz, MAX_PATH, L"%s\\.pkgs0.xz", staging);
+    swprintf_s(tmp_pkgs, MAX_PATH, L"%s\\.pkgs0", staging);
     swprintf_s(url, 1024, L"%s/dists/%s/main/binary-" IP_DEB_ARCH L"/Packages.xz",
                mirror, codename);
     log_msg(L"prefetch: GET %s", url);
-    if (http_download(url, pkgs_xz) != 0) {
-        log_err(L"prefetch: download Packages.xz failed");
+    if (http_download_retry(url, tmp_xz, 3) != 0 ||
+        xz_decompress_file_to_file(tmp_xz, tmp_pkgs) != 0) {
+        log_err(L"prefetch: fetch/decompress %s Packages.xz failed", codename);
         return -1;
     }
+    rel = slurp_bin(tmp_pkgs, &rel_len);
+    DeleteFileW(tmp_xz); DeleteFileW(tmp_pkgs);
+    if (!rel) { log_err(L"prefetch: slurp %s Packages failed", codename); return -1; }
 
-    /* ---- 2. In-process xz decompression via vendored xz-embedded ---- */
-    if (xz_decompress_file_to_file(pkgs_xz, pkgs) != 0) {
-        log_err(L"prefetch: xz decompress failed");
-        return -1;
+    swprintf_s(tmp_xz, MAX_PATH, L"%s\\.pkgs1.xz", staging);
+    swprintf_s(tmp_pkgs, MAX_PATH, L"%s\\.pkgs1", staging);
+    swprintf_s(url, 1024, L"%s/dists/%s-updates/main/binary-" IP_DEB_ARCH L"/Packages.xz",
+               mirror, codename);
+    log_msg(L"prefetch: GET %s", url);
+    if (http_download_retry(url, tmp_xz, 3) == 0 &&
+        xz_decompress_file_to_file(tmp_xz, tmp_pkgs) == 0)
+        upd = slurp_bin(tmp_pkgs, &upd_len);
+    DeleteFileW(tmp_xz); DeleteFileW(tmp_pkgs);
+    if (upd) {
+        log_msg(L"prefetch: merged %s-updates pocket", codename);
+    } else {
+        log_msg(L"prefetch: WARN: %s-updates pocket unavailable, release only", codename);
     }
 
-    /* ---- 3. Slurp Packages into memory + parse ---- */
+    /* Concatenate [release, updates]; the blank line separates the
+       release tail from the first updates stanza even if the release
+       file lacks a trailing newline. */
     pkg_table_t T = { 0 };
-    {
-        HANDLE h = CreateFileW(pkgs, GENERIC_READ, FILE_SHARE_READ, NULL,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h == INVALID_HANDLE_VALUE) { log_err(L"prefetch: open Packages failed"); return -1; }
-        LARGE_INTEGER sz; GetFileSizeEx(h, &sz);
-        T.buf_len = (size_t)sz.QuadPart;
-        T.buf = (char *)malloc(T.buf_len + 1);
-        if (!T.buf) { CloseHandle(h); return -1; }
-        DWORD br = 0;
-        if (!ReadFile(h, T.buf, (DWORD)T.buf_len, &br, NULL) || br != T.buf_len) {
-            log_err(L"prefetch: read Packages failed"); CloseHandle(h); return -1;
-        }
-        T.buf[T.buf_len] = 0;
-        CloseHandle(h);
+    T.buf_len = rel_len + (upd ? upd_len + 2 : 0);
+    T.buf = (char *)malloc(T.buf_len + 1);
+    if (!T.buf) { free(rel); free(upd); return -1; }
+    memcpy(T.buf, rel, rel_len);
+    off = rel_len;
+    if (upd) {
+        T.buf[off++] = '\n'; T.buf[off++] = '\n';
+        memcpy(T.buf + off, upd, upd_len);
+        off += upd_len;
     }
+    T.buf[T.buf_len] = 0;
+    T.buf_len = off;
+    free(rel); free(upd);
+
     if (parse_packages(&T) != 0) { log_err(L"prefetch: parse failed"); return -1; }
     log_msg(L"prefetch: parsed %zu package records", T.n_records);
 
@@ -804,7 +860,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
         swprintf_s(dst, MAX_PATH, L"%s\\%s", staging, basename);
 
         log_msg(L"prefetch: GET %s", basename);
-        if (http_download(url2, dst) != 0) {
+        if (http_download_retry(url2, dst, 3) != 0) {
             log_err(L"prefetch: download %ls failed", basename);
             return -1;
         }
@@ -840,10 +896,6 @@ int do_prefetch_build_deps(const wchar_t *codename,
         swprintf_s(cj, MAX_PATH, L"%s\\.closure.json", staging);
         write_closure_json(&T, cj, codename, kernel_ver);
     }
-
-    /* Clean up Packages.xz — we don't ship it (we wrote our own
-       synthetic Packages with closure entries only). */
-    DeleteFileW(pkgs_xz);
 
     free(T.buf);
     free(T.records);

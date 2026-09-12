@@ -2379,26 +2379,57 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         swprintf_s(args_buf, 2048,
             L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+        /* Fatal, not a warning: without agent-src the firstboot cannot
+           build the agent and the VM boots to a desktop the host can
+           never display or mark complete. Failing here (3 min in, with
+           a clear message) beats a 40-minute doomed build. */
+        if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            asb_log(L"Error: prefetch-repo failed.");
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                      L"Prefetch of Linux guest sources (GitHub) failed. Check network/proxy and try again.");
+            goto done;
+        }
 
-        /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
-           Needs (codename, kernel) detected from the ISO. */
+        /* Prefetch 2: apt build-deps closure from the Ubuntu archive.
+           Needs (codename, kernel) detected from the ISO. ASB_APT_MIRROR
+           overrides archive.ubuntu.com (regional mirrors for flaky
+           direct routes). */
         asb_log(L"Prefetch 2/3: apt build-deps closure...");
         wchar_t codename[64] = L"", kver[64] = L"";
         if (detect_iso_kernel(args->config.image_path,
                               codename, ARRAYSIZE(codename),
-                              kver,     ARRAYSIZE(kver)) == 0) {
+                              kver,     ARRAYSIZE(kver)) != 0) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                      L"Could not detect the ISO's codename/kernel for the apt prefetch.");
+            goto done;
+        }
+        {
             wchar_t apt_out[MAX_PATH];
             swprintf_s(apt_out, MAX_PATH, L"%s\\local-apt-extras", extras);
             swprintf_s(args_buf, 2048,
                 L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
                 L"--out-dir \"%s\"",
                 codename, kver, apt_out);
-            if (spawn_iso_patch_prefetch(args_buf) != 0)
-                asb_log(L"WARN: prefetch-build-deps failed");
-        } else {
-            asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
+            wchar_t mirror[512];
+            DWORD mn = GetEnvironmentVariableW(L"ASB_APT_MIRROR", mirror, 512);
+            if (mn > 0 && mn < 512) {
+                wchar_t tail[600];
+                swprintf_s(tail, 600, L" --mirror \"%s\"", mirror);
+                wcscat_s(args_buf, 2048, tail);
+                asb_log(L"Using apt mirror from ASB_APT_MIRROR: %s", mirror);
+            }
+            /* Fatal, same rationale as Prefetch 1: without the offline
+               apt closure the firstboot cannot install gcc/dkms, the
+               agent never builds, and install never completes. */
+            if (spawn_iso_patch_prefetch(args_buf) != 0) {
+                asb_log(L"Error: prefetch-build-deps failed.");
+                args->result = E_FAIL;
+                wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                          L"apt build-deps prefetch failed. Set ASB_APT_MIRROR to a reachable Ubuntu mirror and try again.");
+                goto done;
+            }
         }
 
         /* Prefetch 3: wsl-deps proprietary .so libs from Microsoft NuGet. */
