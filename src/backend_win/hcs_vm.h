@@ -34,14 +34,13 @@ typedef struct {
     wchar_t os_type[32];          /* L"Windows" or L"Linux" */
     wchar_t image_path[MAX_PATH]; /* ISO path */
     wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
-    wchar_t storage_folder[MAX_PATH]; /* empty = default; transient, not persisted */
     DWORD   ram_mb;
     DWORD   hdd_gb;
     DWORD   cpu_cores;
     int     gpu_mode;             /* GPU_NONE, GPU_DEFAULT, or GPU_MIRROR */
     int     network_mode;         /* NET_NONE, NET_NAT, NET_EXTERNAL, or NET_INTERNAL */
     wchar_t admin_user[128];      /* Guest local admin username */
-    wchar_t admin_pass[128];      /* Guest local admin password */
+    wchar_t admin_pass[256];      /* Guest local admin password */
     wchar_t resources_iso_path[MAX_PATH]; /* ISO with autounattend + agent + helpers */
     GpuDriverShareList gpu_shares;         /* Plan9 shares for GPU driver files */
     BOOL    is_template;              /* TRUE = template creation (no GPU/network) */
