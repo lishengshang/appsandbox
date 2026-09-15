@@ -2922,7 +2922,7 @@ int wmain(int argc, wchar_t *argv[])
 
     if (_wcsicmp(argv[1], L"--prefetch-build-deps") == 0) {
         const wchar_t *codename = NULL, *kver = NULL;
-        const wchar_t *out_dir = NULL, *mirror = NULL;
+        const wchar_t *out_dir = NULL, *mirror = NULL, *iso_root = NULL;
         for (int i = 2; i < argc; i++) {
             if (_wcsicmp(argv[i], L"--codename") == 0 && i + 1 < argc) {
                 codename = argv[++i];
@@ -2932,13 +2932,15 @@ int wmain(int argc, wchar_t *argv[])
                 out_dir = argv[++i];
             } else if (_wcsicmp(argv[i], L"--mirror") == 0 && i + 1 < argc) {
                 mirror = argv[++i];
+            } else if (_wcsicmp(argv[i], L"--iso-root") == 0 && i + 1 < argc) {
+                iso_root = argv[++i];
             }
         }
-        if (!codename || !kver || !out_dir) {
-            log_err(L"--prefetch-build-deps requires --codename, --kernel, --out-dir");
+        if (!codename || !kver || !out_dir || !iso_root) {
+            log_err(L"--prefetch-build-deps requires --codename, --kernel, --out-dir, --iso-root");
             return 1;
         }
-        return do_prefetch_build_deps(codename, kver, out_dir, mirror);
+        return do_prefetch_build_deps(codename, kver, out_dir, mirror, iso_root);
     }
 
     if (_wcsicmp(argv[1], L"--ubuntu-to-vhdx") == 0) {

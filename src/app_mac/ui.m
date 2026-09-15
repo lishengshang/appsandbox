@@ -55,6 +55,7 @@ static void postToJs(NSDictionary *message) {
 #pragma mark - Event translation
 
 static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
+    BOOL isWindows = strcasecmp(vm->os_type, "Windows") == 0;
     return @{
         @"name":            [NSString stringWithUTF8String:vm->name],
         @"osType":          [NSString stringWithUTF8String:vm->os_type],
@@ -66,8 +67,8 @@ static NSDictionary *vmToJsDict(const AsbVmMac *vm) {
         @"hddGb":           @(vm->hdd_gb),
         @"cpuCores":        @(vm->cpu_cores),
         @"gpuMode":         @(vm->gpu_mode),
-        @"gpuName":         [HostInfo hostGpuName],
-        @"networkMode":     @(vm->network_mode),
+        @"gpuName":         isWindows ? @"Software (WARP)" : [HostInfo hostGpuName],
+        @"networkMode":     @1,
         @"netAdapter":      @"",
         @"isTemplate":      @NO,
         @"hypervVideoOff":  @NO,
@@ -281,7 +282,7 @@ static void handleCreateVm(NSDictionary *msg) {
     int hddGb           = [msg[@"hddGb"] intValue];
     int cpuCores        = [msg[@"cpuCores"] intValue];
     int gpuMode         = [msg[@"gpuMode"] intValue];
-    int networkMode     = [msg[@"networkMode"] intValue];
+    int networkMode     = 1;
 
     NSString *usernameError = asb_mac_validate_username(osType, adminUser, name);
     if (usernameError) {
@@ -343,10 +344,23 @@ static void handleEditVm(NSDictionary *msg) {
     NSString *n = vmNameAtIndex(msg[@"vmIndex"]);
     NSString *field = msg[@"field"];
     id rawValue = msg[@"value"];
+    if (!n || ![field isKindOfClass:[NSString class]] ||
+        (![rawValue isKindOfClass:[NSString class]] && ![rawValue isKindOfClass:[NSNumber class]])) {
+        sendAlert(@"VM configuration could not be updated.");
+        sendVmListChanged();
+        return;
+    }
     NSString *value = [rawValue isKindOfClass:[NSString class]]
         ? rawValue : [NSString stringWithFormat:@"%@", rawValue];
-    if (!n || !field || !value) return;
-    asb_mac_vm_edit([n UTF8String], [field UTF8String], [value UTF8String]);
+    AsbVmMac *vm = asb_mac_vm_find(n.UTF8String);
+    if (!vm) {
+        sendAlert(@"VM configuration could not be updated.");
+    } else if (vm->running || (!vm->disk_built && vm->install_progress >= 0)) {
+        sendAlert(@"VM settings can only be changed when the VM is stopped and its disk build has finished.");
+    } else {
+        int rc = asb_mac_vm_edit([n UTF8String], [field UTF8String], [value UTF8String]);
+        if (rc != BACKEND_OK) sendAlert(@"VM configuration could not be updated.");
+    }
     sendVmListChanged();
 }
 

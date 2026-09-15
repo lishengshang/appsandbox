@@ -65,7 +65,7 @@
 <div class="modal-overlay" id="create-vm-overlay">
     <div class="modal wide">
         <h3>New Sandbox</h3>
-        <div class="create-form-body">
+        <div class="modal-form-body">
         <div class="form-grid">
             <label for="os-type">OS Type:</label>
             <div class="form-row">
@@ -131,8 +131,8 @@
                 </select>
             </div>
 
-            <label for="net-mode">Network:</label>
-            <div class="form-row">
+            <label for="net-mode" class="windows-host-only">Network:</label>
+            <div class="form-row windows-host-only">
                 <select id="net-mode" onchange="onNetModeChange()">
                     <option value="0">None</option>
                     <option value="1" selected>NAT</option>
@@ -191,6 +191,69 @@
         <div class="modal-buttons">
             <button onclick="closeDiskLocationModal(false)">Cancel</button>
             <button id="btn-save-disk-location" class="primary" onclick="closeDiskLocationModal(true)">Save</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="edit-vm-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="edit-vm-title">
+        <h3 id="edit-vm-title">Edit</h3>
+        <div class="modal-form-body">
+            <div class="form-grid">
+                <label for="edit-ram-size">RAM Size:</label>
+                <div class="form-row">
+                    <input type="number" id="edit-ram-size" min="512" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
+                    <span class="host-info" id="edit-host-ram"></span>
+                </div>
+
+                <label for="edit-cpu-cores">CPU Cores:</label>
+                <div class="form-row">
+                    <input type="number" id="edit-cpu-cores" min="1" class="input-sm" aria-describedby="edit-vm-warn">
+                    <span class="host-info" id="edit-host-cpu"></span>
+                </div>
+
+                <label for="edit-gpu-mode" class="win-only">GPU:</label>
+                <div class="form-row win-only">
+                    <select id="edit-gpu-mode">
+                        <option value="0">None</option>
+                        <option value="1">Default GPU</option>
+                        <option value="2">Try all</option>
+                    </select>
+                </div>
+
+                <label for="edit-net-mode" class="win-only">Network:</label>
+                <div class="form-row win-only">
+                    <select id="edit-net-mode">
+                        <option value="0">None</option>
+                        <option value="1">NAT</option>
+                        <option value="2">External</option>
+                        <option value="3">Internal</option>
+                    </select>
+                </div>
+            </div>
+            <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeEditVmModal()">Cancel</button>
+            <button id="btn-save-edit-vm" class="primary" onclick="saveEditVm()">Save</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="snapshot-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="snapshot-title">
+        <h3 id="snapshot-title">Snapshots</h3>
+        <div class="modal-form-body">
+            <p id="snapshot-current"></p>
+            <div id="snapshot-tree" role="group" aria-label="Snapshots and branches" aria-describedby="snapshot-help"></div>
+            <p id="snapshot-help"></p>
+            <span id="snapshot-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button id="btn-snapshot-create" class="primary" onclick="takeSnapshot()">New Snapshot</button>
+            <button id="btn-snapshot-rename" onclick="renameSnapshot()">Rename</button>
+            <button id="btn-snapshot-delete" class="danger" onclick="deleteSnapshot()">Delete</button>
+            <button onclick="closeSnapshotModal()">Close</button>
         </div>
     </div>
 </div>

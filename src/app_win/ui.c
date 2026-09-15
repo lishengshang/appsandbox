@@ -1216,14 +1216,22 @@ static void on_webview2_message(const wchar_t *json)
             json_get_string(json, L"field", field, 64) &&
             json_get_string(json, L"value", value, 256)) {
             AsbVm vm = asb_vm_get(idx);
-            if (wcscmp(field, L"name") == 0) asb_vm_set_name(vm, value);
-            else if (wcscmp(field, L"ramMb") == 0) asb_vm_set_ram(vm, (DWORD)_wtoi(value));
-            else if (wcscmp(field, L"cpuCores") == 0) asb_vm_set_cpu(vm, (DWORD)_wtoi(value));
-            else if (wcscmp(field, L"gpuMode") == 0) asb_vm_set_gpu(vm, _wtoi(value));
-            else if (wcscmp(field, L"networkMode") == 0) asb_vm_set_network(vm, _wtoi(value));
-            asb_save();
-            send_vm_list();
+            if (asb_vm_is_running(vm) || asb_vm_is_building(vm)) {
+                ui_show_alert(L"VM settings can only be changed when the VM is stopped and its disk build has finished.");
+            } else {
+                HRESULT hr = E_INVALIDARG;
+                if (wcscmp(field, L"name") == 0) hr = asb_vm_set_name(vm, value);
+                else if (wcscmp(field, L"ramMb") == 0) hr = asb_vm_set_ram(vm, (DWORD)_wtoi(value));
+                else if (wcscmp(field, L"cpuCores") == 0) hr = asb_vm_set_cpu(vm, (DWORD)_wtoi(value));
+                else if (wcscmp(field, L"gpuMode") == 0) hr = asb_vm_set_gpu(vm, _wtoi(value));
+                else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                if (FAILED(hr)) ui_show_alert(L"VM configuration could not be updated.");
+                else asb_save();
+            }
+        } else {
+            ui_show_alert(L"VM configuration could not be updated.");
         }
+        send_vm_list();
     } else if (wcscmp(action, L"selectVm") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx)) g_selected_vm = idx;

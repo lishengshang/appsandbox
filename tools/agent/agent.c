@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include "p9copy.h"
+#include "gl_vk_provision.h"
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -451,370 +452,17 @@ static BOOL deploy_ssh_key(const char *pubkey)
     return TRUE;
 }
 
-/* File size in bytes, or (ULONGLONG)-1 if the file is absent. */
-static ULONGLONG file_size_w(const wchar_t *path)
-{
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
-        return (ULONGLONG)-1;
-    return ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-}
-
-/* Case-insensitive wcsstr. */
-static const wchar_t *wcsistr(const wchar_t *hay, const wchar_t *needle)
-{
-    size_t n = wcslen(needle);
-    for (; *hay; hay++)
-        if (_wcsnicmp(hay, needle, n) == 0)
-            return hay;
-    return NULL;
-}
-
-/* The NGX (DLSS) loader linked into games asks dxgkrnl for the driver-store
-   path without the TranslatePath flag and gets the HOST path back
-   (System32\DriverStore\FileRepository\<dir>). In the guest that path doesn't
-   exist — the files live under HostDriverStore — so _nvngx.dll is never found
-   and DLSS is never offered. Make the host path valid: a junction
-   DriverStore\FileRepository\<dir> -> HostDriverStore\FileRepository\<dir>.
-   Vendor-agnostic and idempotent; FileRepository is TrustedInstaller-owned so
-   take it first. */
-static void driverstore_junction(const wchar_t *dest)
-{
-    static const wchar_t marker[] = L"\\HostDriverStore\\FileRepository\\";
-    wchar_t sys[MAX_PATH], repo[MAX_PATH], link[MAX_PATH], cmd[MAX_PATH * 3];
-    const wchar_t *leaf;
-    DWORD attrs;
-
-    leaf = wcsistr(dest, marker);
-    if (!leaf) return;
-    leaf += wcslen(marker);
-    if (!*leaf || wcschr(leaf, L'\\')) return;   /* expect exactly one component */
-    if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
-
-    swprintf_s(repo, MAX_PATH, L"%s\\DriverStore\\FileRepository", sys);
-    swprintf_s(link, MAX_PATH, L"%s\\%s", repo, leaf);
-    attrs = GetFileAttributesW(link);
-    if (attrs != INVALID_FILE_ATTRIBUTES) {
-        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
-            agent_log("DriverStore junction already present: %ls", link);
-        else
-            agent_log("DriverStore: %ls exists as a real directory - leaving it alone", link);
-        return;
-    }
-
-    swprintf_s(cmd, MAX_PATH * 3, L"%s\\takeown.exe /f \"%s\" /a", sys, repo);
-    run_quiet(cmd);
-    swprintf_s(cmd, MAX_PATH * 3, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:(M)", sys, repo);
-    run_quiet(cmd);
-    swprintf_s(cmd, MAX_PATH * 3, L"%s\\cmd.exe /c mklink /J \"%s\" \"%s\"", sys, link, dest);
-    run_quiet(cmd);
-
-    attrs = GetFileAttributesW(link);
-    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
-        agent_log("DriverStore junction created: %ls -> %ls", link, dest);
-    else
-        agent_log("DriverStore junction failed for %ls (%lu)", link, GetLastError());
-}
-
-/* TRUE if `path` is our nvapi64 proxy (exports appsandbox_nvapi_proxy). Loaded
-   without running DllMain or resolving imports, so it's safe on any DLL. */
-static BOOL is_nvapi_proxy(const wchar_t *path)
-{
-    HMODULE m = LoadLibraryExW(path, NULL, DONT_RESOLVE_DLL_REFERENCES);
-    BOOL yes = FALSE;
-    if (m) {
-        yes = GetProcAddress(m, "appsandbox_nvapi_proxy") != NULL;
-        FreeLibrary(m);
-    }
-    return yes;
-}
-
-/* TRUE if `dst` is a copy of `src` (same size and last-write time, which
-   CopyFile preserves). A missing `dst` counts as different. */
-static BOOL same_file_stamp(const wchar_t *src, const wchar_t *dst)
-{
-    WIN32_FILE_ATTRIBUTE_DATA a, b;
-    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &a) ||
-        !GetFileAttributesExW(dst, GetFileExInfoStandard, &b))
-        return FALSE;
-    return a.nFileSizeLow == b.nFileSizeLow && a.nFileSizeHigh == b.nFileSizeHigh &&
-           CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
-}
-
-/* TRUE if `path` exports `marker`. Mapped without running DllMain or resolving
-   imports, so it's safe on any DLL. */
-static BOOL dll_has_export(const wchar_t *path, const char *marker)
-{
-    HMODULE m = LoadLibraryExW(path, NULL, DONT_RESOLVE_DLL_REFERENCES);
-    BOOL yes = FALSE;
-    if (m) {
-        yes = GetProcAddress(m, marker) != NULL;
-        FreeLibrary(m);
-    }
-    return yes;
-}
-
-/* TRUE if an NVIDIA display driver copied from the host ships its OpenGL/Vulkan
-   ICD: some HostDriverStore\FileRepository\*\nvoglv64.dll exists. That is
-   the file Microsoft's opengl32 will be pointed at by the paravirtualized
-   adapter (KMTQAITYPE_UMOPENGLINFO comes back translated into HostDriverStore). */
-static BOOL nvidia_gl_icd_present(void)
-{
-    wchar_t sys[MAX_PATH], pattern[MAX_PATH], icd[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    HANDLE hf;
-    BOOL found = FALSE;
-
-    if (!GetSystemDirectoryW(sys, MAX_PATH)) return FALSE;
-    swprintf_s(pattern, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\*", sys);
-    hf = FindFirstFileW(pattern, &fd);
-    if (hf == INVALID_HANDLE_VALUE) return FALSE;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
-            continue;
-        swprintf_s(icd, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\%s\\nvoglv64.dll", sys, fd.cFileName);
-        if (file_size_w(icd) != (ULONGLONG)-1) found = TRUE;
-    } while (!found && FindNextFileW(hf, &fd));
-    FindClose(hf);
-    return found;
-}
-
-/* Replace the in-use, TrustedInstaller-owned `dst` with `src`: take ownership,
-   grant SYSTEM, rename the mapped file aside, copy ours in. */
-static BOOL replace_system_dll(const wchar_t *sys, const wchar_t *src, const wchar_t *dst, const wchar_t *aside)
-{
-    wchar_t cmd[MAX_PATH * 2];
-    swprintf_s(cmd, MAX_PATH * 2, L"%s\\takeown.exe /f \"%s\"", sys, dst);
-    run_quiet(cmd);
-    swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dst);
-    run_quiet(cmd);
-    MoveFileExW(dst, aside, MOVEFILE_REPLACE_EXISTING);
-    if (!CopyFileW(src, dst, FALSE)) return FALSE;
-    DeleteFileW(aside);                           /* fails while still mapped; harmless */
-    return TRUE;
-}
-
-/* NVIDIA's nvapi64.dll as shipped by the active display driver: the
-   HostDriverStore directory that also carries nvapi64_impl.dll (a guest keeps
-   the directories of earlier drivers around; the newest one wins). */
-static BOOL nvapi_driver_stub(wchar_t *out, size_t cch)
-{
-    wchar_t sys[MAX_PATH], repo[MAX_PATH], pattern[MAX_PATH], probe[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    WIN32_FILE_ATTRIBUTE_DATA impl;
-    FILETIME best = { 0, 0 };
-    HANDLE hf;
-    BOOL found = FALSE;
-
-    if (!GetSystemDirectoryW(sys, MAX_PATH)) return FALSE;
-    swprintf_s(repo, MAX_PATH, L"%s\\HostDriverStore\\FileRepository", sys);
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", repo);
-    hf = FindFirstFileW(pattern, &fd);
-    if (hf == INVALID_HANDLE_VALUE) return FALSE;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
-            continue;
-        swprintf_s(probe, MAX_PATH, L"%s\\%s\\nvapi64_impl.dll", repo, fd.cFileName);
-        if (!GetFileAttributesExW(probe, GetFileExInfoStandard, &impl))
-            continue;
-        swprintf_s(probe, MAX_PATH, L"%s\\%s\\nvapi64.dll", repo, fd.cFileName);
-        if (file_size_w(probe) == (ULONGLONG)-1)
-            continue;
-        if (!found || CompareFileTime(&impl.ftLastWriteTime, &best) > 0) {
-            found = TRUE;
-            best = impl.ftLastWriteTime;
-            wcscpy_s(out, cch, probe);
-        }
-    } while (FindNextFileW(hf, &fd));
-    FindClose(hf);
-    return found;
-}
-
-/* Bring nvapi64_orig.dll (what the deployed proxy forwards to) up to the
-   driver's own nvapi64.dll when they differ. The file may be mapped by a
-   running game, so rename it aside first, like opengl32 above. */
-static void nvapi_orig_refresh(const wchar_t *orig, const wchar_t *sys)
-{
-    wchar_t stub[MAX_PATH], oldp[MAX_PATH];
-
-    if (!nvapi_driver_stub(stub, MAX_PATH) || same_file_stamp(stub, orig))
-        return;
-    swprintf_s(oldp, MAX_PATH, L"%s\\nvapi64_orig.dll.old", sys);
-    MoveFileExW(orig, oldp, MOVEFILE_REPLACE_EXISTING);
-    if (CopyFileW(stub, orig, FALSE)) {
-        agent_log("NVAPI proxy: refreshed nvapi64_orig.dll from %ls.", stub);
-        DeleteFileW(oldp);                        /* fails while mapped; harmless */
-    } else {
-        agent_log("NVAPI proxy: refreshing nvapi64_orig.dll failed (%lu) - keeping the previous one.", GetLastError());
-        MoveFileExW(oldp, orig, MOVEFILE_REPLACE_EXISTING);
-    }
-}
-
-/* NVIDIA GPU-PV guests: NVAPI works, except the two calls that map a physical
-   GPU to its WDDM adapter LUID (there is no NVIDIA KMD in the guest to ask) —
-   they answer NVAPI_NOT_SUPPORTED and NGX treats that as unsupported hardware,
-   so DLSS stays greyed out. tools/nvapi-proxy is a forwarding nvapi64.dll that
-   fills in just those two answers with the LUID of the caller's D3D device.
-   Deploy it over System32\nvapi64.dll, keeping NVIDIA's stub as nvapi64_orig.dll
-   (the proxy loads it from there). Same TrustedInstaller dance as opengl32
-   above. Upgrades itself when the proxy changes, and keeps nvapi64_orig.dll in
-   step with the driver: the proxy carries a 99.0 version resource so dxgkrnl's
-   CopyToVmWhenNewer never puts NVIDIA's stub back over it, which also means
-   nothing else would refresh the stub after a driver update. */
-static void nvapi_proxy_provision(const wchar_t *dir)
-{
-    wchar_t sys[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], orig[MAX_PATH], oldp[MAX_PATH];
-    wchar_t cmd[MAX_PATH * 2];
-
-    swprintf_s(src, MAX_PATH, L"%s\\nvapi64_proxy.dll", dir);
-    if (file_size_w(src) == (ULONGLONG)-1)
-        return;                                   /* not shipped on this build */
-    if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
-    swprintf_s(dst,  MAX_PATH, L"%s\\nvapi64.dll", sys);
-    swprintf_s(orig, MAX_PATH, L"%s\\nvapi64_orig.dll", sys);
-    swprintf_s(oldp, MAX_PATH, L"%s\\nvapi64.dll.old", sys);
-
-    if (file_size_w(dst) == (ULONGLONG)-1) {
-        agent_log("NVAPI proxy: no System32\\nvapi64.dll (no NVIDIA GPU-PV driver) - skipping.");
-        return;
-    }
-    /* Files renamed aside by an earlier update while a game (or Steam,
-       Sunshine...) still had them mapped: gone by now, so clean up. */
-    DeleteFileW(oldp);
-    swprintf_s(cmd, MAX_PATH * 2, L"%s\\nvapi64_orig.dll.old", sys);
-    DeleteFileW(cmd);
-    if (is_nvapi_proxy(dst)) {
-        nvapi_orig_refresh(orig, sys);
-        if (same_file_stamp(src, dst)) {
-            agent_log("NVAPI proxy: already current in System32.");
-            return;
-        }
-        agent_log("NVAPI proxy: updating deployed proxy.");
-    } else {
-        /* NVIDIA's stub (fresh guest or re-staged by a driver update): keep it
-           as the original the proxy forwards to. Overwrite a stale copy. */
-        if (!CopyFileW(dst, orig, FALSE)) {
-            agent_log("NVAPI proxy: cannot preserve NVIDIA nvapi64.dll (%lu) - not deploying.", GetLastError());
-            return;
-        }
-        agent_log("NVAPI proxy: preserved NVIDIA stub as nvapi64_orig.dll.");
-    }
-
-    swprintf_s(cmd, MAX_PATH * 2, L"%s\\takeown.exe /f \"%s\"", sys, dst);
-    run_quiet(cmd);
-    swprintf_s(cmd, MAX_PATH * 2, L"%s\\icacls.exe \"%s\" /grant *S-1-5-18:F", sys, dst);
-    run_quiet(cmd);
-    MoveFileExW(dst, oldp, MOVEFILE_REPLACE_EXISTING);  /* rename in-use aside */
-    if (CopyFileW(src, dst, FALSE)) {
-        agent_log("NVAPI proxy: deployed to System32\\nvapi64.dll.");
-        DeleteFileW(oldp);                        /* fails while mapped; harmless */
-    } else {
-        agent_log("NVAPI proxy: copy to System32 failed (%lu).", GetLastError());
-    }
-}
-
-/* Point one guest copy of NVIDIA's Vulkan manifest at our shim: the ICD's
-   library_path ".\\nvoglv64.dll" becomes ".\\asb_nvvk.dll" (same length, the
-   layer entries further down keep pointing at nvoglv64.dll). Returns 1 if it
-   rewrote the file, 0 if it was already ours, -1 if untouched. */
-static int nvvk_patch_manifest(const wchar_t *json)
-{
-    static const char icd_key[] = "\"ICD\"", from[] = ".\\\\nvoglv64.dll", to[] = ".\\\\asb_nvvk.dll";
-    const DWORD cap = 64 * 1024;                  /* the manifest is ~1 KB; anything larger is not ours to touch */
-    char *buf, *icd, *hit;
-    HANDLE h;
-    DWORD n = 0, w = 0;
-    int rc = -1;
-
-    h = CreateFileW(json, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    buf = (char *)malloc(cap);
-    if (!buf) { CloseHandle(h); return -1; }
-    if (ReadFile(h, buf, cap - 1, &n, NULL) && n > 0 && n < cap - 1) {
-        buf[n] = 0;
-        icd = strstr(buf, icd_key);
-        if (icd && strstr(icd, to))
-            rc = 0;
-        else if (icd && (hit = strstr(icd, from)) != NULL) {
-            memcpy(hit, to, sizeof(to) - 1);
-            if (SetFilePointer(h, 0, NULL, FILE_BEGIN) == 0 && WriteFile(h, buf, n, &w, NULL) && w == n)
-                rc = 1;
-        }
-    }
-    free(buf);
-    CloseHandle(h);
-    return rc;
-}
-
-/* NVIDIA GPU-PV guests: native Vulkan. The loader already finds NVIDIA's
-   nv-vk64.json on its own (VulkanDriverName comes back from the host through
-   the paravirtualized adapter and resolves into HostDriverStore), and the
-   driver itself works through the VRD, but nvoglv64.dll looks for its GPUs
-   behind GDI display devices and in a guest none belongs to it, so it reports
-   no device and Vulkan games get Mesa's Vulkan-on-D3D12 (Dozen) instead.
-   tools/nvvk-shim is a small ICD wrapper that fixes that discovery (see
-   nvvk_shim.cpp). Drop it next to nvoglv64.dll in every driver-store copy
-   that ships a Vulkan manifest and point the manifest at it. Runs after each
-   GPU copy: a driver update brings a new directory with a fresh manifest.
-   32-bit (nv-vk32.json) is left alone: no x86 shim yet. */
-static void nvvk_shim_provision(const wchar_t *dir)
-{
-    wchar_t src[MAX_PATH], sys[MAX_PATH], repo[MAX_PATH], pattern[MAX_PATH];
-    wchar_t json[MAX_PATH], dst[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    HANDLE hf;
-    int dirs = 0;
-
-    swprintf_s(src, MAX_PATH, L"%s\\asb_nvvk.dll", dir);
-    if (file_size_w(src) == (ULONGLONG)-1)
-        return;                                   /* not shipped on this build */
-    if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
-    swprintf_s(repo, MAX_PATH, L"%s\\HostDriverStore\\FileRepository", sys);
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", repo);
-
-    hf = FindFirstFileW(pattern, &fd);
-    if (hf == INVALID_HANDLE_VALUE) return;
-    do {
-        int rc;
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.')
-            continue;
-        swprintf_s(json, MAX_PATH, L"%s\\%s\\nv-vk64.json", repo, fd.cFileName);
-        if (file_size_w(json) == (ULONGLONG)-1)
-            continue;                             /* not an NVIDIA display driver dir */
-        dirs++;
-        swprintf_s(dst, MAX_PATH, L"%s\\%s\\asb_nvvk.dll", repo, fd.cFileName);
-        if (!same_file_stamp(src, dst) && !CopyFileW(src, dst, FALSE)) {
-            agent_log("NVVK shim: copy to %ls failed (%lu) - leaving manifest alone.", dst, GetLastError());
-            continue;                             /* in use by a running app; next boot */
-        }
-        rc = nvvk_patch_manifest(json);
-        if (rc == 1)
-            agent_log("NVVK shim: registered as Vulkan ICD in %ls", json);
-        else if (rc == 0)
-            agent_log("NVVK shim: already registered in %ls", json);
-        else
-            agent_log("NVVK shim: %ls not rewritten (unexpected format or write failed).", json);
-    } while (FindNextFileW(hf, &fd));
-    FindClose(hf);
-    if (!dirs)
-        agent_log("NVVK shim: no NVIDIA Vulkan manifest in HostDriverStore - skipping.");
-}
-
-/* Provision the D3D mapping layers after the agent has copied them into `dir`
-   (C:\Windows\AppSandbox\d3dlayers) over Plan9. Runs as SYSTEM from the GPU copy
-   thread, AFTER the GPU driver copy. Deploys Mesa's standalone opengl32 trio +
-   dxil.dll into System32 and registers the OpenCL + Vulkan ICDs via their Khronos
-   registry keys. Idempotent + self-healing across boots. */
-static void gl_provision(const wchar_t *dir)
+static void gl_provision(const wchar_t *dir, const wchar_t *native_dir)
 {
     wchar_t path[MAX_PATH], sys[MAX_PATH], dst[MAX_PATH];
     HKEY key;
     DWORD zero = 0;
+    BOOL native_runtime = FALSE;
 
-    agent_log("GL: provisioning mapping layers from %ls", dir);
+    agent_log("GL: provisioning GPU runtimes from %ls", dir[0] ? dir : native_dir);
 
     /* dxil.dll -> System32 (OpenGLOn12 / vulkan_dzn load it by leaf name). */
-    if (GetSystemDirectoryW(sys, MAX_PATH)) {
+    if (dir[0] && GetSystemDirectoryW(sys, MAX_PATH)) {
         swprintf_s(path, MAX_PATH, L"%s\\dxil.dll", dir);
         swprintf_s(dst, MAX_PATH, L"%s\\dxil.dll", sys);
         if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
@@ -825,118 +473,51 @@ static void gl_provision(const wchar_t *dir)
         }
     }
 
-    /* OpenGL: what goes into System32 as opengl32.dll.
-       - NVIDIA GPU-PV guest with the wrapper shipped (tools/nvgl-wrapper): the
-         wrapper, with Microsoft's opengl32.dll kept beside it as asb_gl_ms.dll.
-         Microsoft's code already finds NVIDIA's ICD through the paravirtualized
-         adapter; the wrapper only fixes the ICD's GPU discovery (same trick as
-         the Vulkan shim), so OpenGL apps run on NVIDIA's own driver.
-       - otherwise Mesa's standalone opengl32 trio (OpenGL on D3D12). */
     if (GetSystemDirectoryW(sys, MAX_PATH)) {
-        wchar_t srcdll[MAX_PATH], dstdll[MAX_PATH], bak[MAX_PATH], oldp[MAX_PATH], mesa[MAX_PATH], msdll[MAX_PATH];
-        BOOL use_nv, cur_wrapper, cur_mesa, cur_ms;
-        const wchar_t *what;
-
-        /* gallium_wgl.dll + z-1.dll: copied into System32 (Mesa's opengl32 imports them). */
-        swprintf_s(srcdll, MAX_PATH, L"%s\\gallium_wgl.dll", dir);
-        swprintf_s(dstdll, MAX_PATH, L"%s\\gallium_wgl.dll", sys);
-        CopyFileW(srcdll, dstdll, FALSE);
-        swprintf_s(srcdll, MAX_PATH, L"%s\\z-1.dll", dir);
-        swprintf_s(dstdll, MAX_PATH, L"%s\\z-1.dll", sys);
-        CopyFileW(srcdll, dstdll, FALSE);
-
-        swprintf_s(mesa,   MAX_PATH, L"%s\\opengl32.dll", dir);
-        swprintf_s(srcdll, MAX_PATH, L"%s\\asb_opengl32.dll", dir);
-        swprintf_s(dstdll, MAX_PATH, L"%s\\opengl32.dll", sys);
-
-        swprintf_s(bak,    MAX_PATH, L"%s\\opengl32.dll.msbak", sys);
-        swprintf_s(oldp,   MAX_PATH, L"%s\\opengl32.dll.old", sys);
-        swprintf_s(msdll,  MAX_PATH, L"%s\\asb_gl_ms.dll", sys);
-        DeleteFileW(oldp);                        /* left by an earlier swap while mapped */
-
-        /* What is in System32 right now: our wrapper, Mesa's, or Microsoft's
-           (fresh guest, or Windows servicing put it back). Keep Microsoft's
-           current build as the backup the wrapper forwards to. */
-        cur_wrapper = dll_has_export(dstdll, "appsandbox_nvgl_wrapper");
-        cur_mesa = !cur_wrapper && file_size_w(mesa) != (ULONGLONG)-1 && file_size_w(mesa) == file_size_w(dstdll);
-        cur_ms = !cur_wrapper && !cur_mesa && file_size_w(dstdll) != (ULONGLONG)-1;
-        if (cur_ms && !same_file_stamp(dstdll, bak)) {
-            if (CopyFileW(dstdll, bak, FALSE))
-                agent_log("GL: saved Microsoft opengl32.dll as opengl32.dll.msbak.");
-            else
-                agent_log("GL: cannot back up Microsoft opengl32.dll (%lu).", GetLastError());
-        }
-
-        use_nv = file_size_w(srcdll) != (ULONGLONG)-1 && file_size_w(bak) != (ULONGLONG)-1 && nvidia_gl_icd_present();
-        if (use_nv && !same_file_stamp(bak, msdll)) {
-            wchar_t msold[MAX_PATH];
-            swprintf_s(msold, MAX_PATH, L"%s\\asb_gl_ms.dll.old", sys);
-            DeleteFileW(msold);
-            MoveFileExW(msdll, msold, MOVEFILE_REPLACE_EXISTING);   /* may be mapped by a running app */
-            if (CopyFileW(bak, msdll, FALSE)) {
-                agent_log("GL: staged Microsoft opengl32.dll as asb_gl_ms.dll.");
-                DeleteFileW(msold);
-            } else {
-                agent_log("GL: asb_gl_ms.dll copy failed (%lu) - falling back to Mesa.", GetLastError());
-                MoveFileExW(msold, msdll, MOVEFILE_REPLACE_EXISTING);
-                use_nv = FALSE;
-            }
-        }
-        if (!use_nv) {
-            wcscpy_s(srcdll, MAX_PATH, mesa);
-            what = L"Mesa opengl32 trio";
-        } else {
-            what = L"NVIDIA OpenGL wrapper";
-        }
-
-        /* opengl32.dll is TrustedInstaller-owned and memory-mapped. Replace it
-           only when it isn't already the one we want (size or timestamp differ);
-           self-heals if Windows servicing/SFC restores Microsoft's. */
-        if (file_size_w(srcdll) == (ULONGLONG)-1) {
-            agent_log("GL: no opengl32 to deploy in %ls.", dir);
-        } else if (same_file_stamp(srcdll, dstdll) ||
-                   (!use_nv && cur_mesa && file_size_w(srcdll) == file_size_w(dstdll))) {
-            agent_log("GL: %ls already current in System32.", what);
-        } else if (replace_system_dll(sys, srcdll, dstdll, oldp)) {
-            agent_log("GL: deployed %ls to System32.", what);
-        } else {
+        if (gl_vk_provision_runtime(dir, native_dir, sys, &native_runtime))
+            agent_log("GL: OpenGL runtime provisioned in System32.");
+        else
             agent_log("GL: opengl32 -> System32 failed (%lu).", GetLastError());
-        }
     } else {
         agent_log("GL: GetSystemDirectory failed; OpenGL not deployed.");
     }
 
     /* OpenCL: Khronos vendor key — value name = ICD path, data 0 (= load it). */
-    swprintf_s(path, MAX_PATH, L"%s\\OpenCLOn12.dll", dir);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenCL\\Vendors",
-                0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
-            RegSetValueExW(key, path, 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
-            RegCloseKey(key);
-            agent_log("GL: registered OpenCL ICD %ls", path);
+    if (dir[0]) {
+        swprintf_s(path, MAX_PATH, L"%s\\OpenCLOn12.dll", dir);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenCL\\Vendors",
+                    0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
+                RegSetValueExW(key, path, 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+                RegCloseKey(key);
+                agent_log("GL: registered OpenCL ICD %ls", path);
+            }
         }
     }
 
-    /* Vulkan: Khronos driver key — value name = ICD manifest path, data 0.
+    /* Vulkan: Khronos driver key — value name = ICD manifest path.
        The manifest's library_path is the absolute guest DLL path (set host-side
        in d3dlayers.c) so the loader can LoadLibraryEx it under
        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, which requires a fully-qualified path. */
-    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.json", dir);
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+    if (dir[0]) {
+        swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.json", dir);
+    } else {
+        UINT length = GetWindowsDirectoryW(dst, MAX_PATH);
+        if (!length || length >= MAX_PATH ||
+            swprintf_s(path, MAX_PATH, L"%s\\AppSandbox\\d3dlayers\\dzn_icd.json", dst) < 0)
+            return;
+    }
+    if (native_runtime || GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        DWORD disabled = native_runtime ? 1 : 0;
         if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\Vulkan\\Drivers",
                 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) == ERROR_SUCCESS) {
-            RegSetValueExW(key, path, 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+            RegSetValueExW(key, path, 0, REG_DWORD, (const BYTE *)&disabled, sizeof(disabled));
             RegCloseKey(key);
-            agent_log("GL: registered Vulkan (Dozen) ICD %ls", path);
+            if (!native_runtime) agent_log("GL: registered Vulkan (Dozen) ICD %ls", path);
         }
     }
 
     agent_log("GL: provisioning complete.");
-
-    /* NVIDIA GPU-PV: NVAPI proxy so NGX/DLSS can initialise (see above). */
-    nvapi_proxy_provision(dir);
-    /* NVIDIA GPU-PV: native Vulkan ICD shim (see above). */
-    nvvk_shim_provision(dir);
 }
 
 /* NVIDIA's installer makes DRS writable by desktop and packaged applications.
@@ -990,9 +571,10 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     int total_files = 0;
     int failed_shares = 0;
     char msg[256];
-    wchar_t gl_dir[MAX_PATH];
+    wchar_t gl_dir[MAX_PATH], native_dir[MAX_PATH];
 
     gl_dir[0] = 0;
+    native_dir[0] = 0;
     agent_log("GPU copy starting (%d shares)...", state->count);
 
     for (i = 0; i < state->count; i++) {
@@ -1022,13 +604,21 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
             /* This list is also sent after reconnects. Seed missing files;
                existing profiles belong to the guest. The host's runtime
                lock file is recreated locally by NVIDIA when needed. */
-            const P9CopyOptions options = { TRUE, "nvdrswr.lk" };
+            const P9CopyOptions options = { TRUE, "nvdrswr.lk", NULL };
             if (nvidia_drs_prepare(dest_wide))
                 rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
                                      si->filter[0] ? si->filter : NULL,
                                      &options, &files);
             else
                 rc = P9_ERR_IO;
+        } else if (strcmp(si->share_name, "AppSandbox.Nvidia") == 0) {
+            const P9CopyOptions options = {
+                FALSE, NULL, "appsandbox-nvidia-vk-gl-shim.dll;appsandbox-nvidia-vk-gl-shim32.dll;"
+                             "appsandbox-nvidia-dlss-shim.dll"
+            };
+            rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
+                                 si->filter[0] ? si->filter : NULL,
+                                 &options, &files);
         } else {
             rc = p9_copy_share(50001, si->share_name, dest_wide,
                                si->filter[0] ? si->filter : NULL, &files);
@@ -1039,9 +629,8 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
             failed_shares++;
         } else {
             agent_log("GPU copy share '%s' done (%d files).", si->share_name, files);
-            /* Driver-store shares: also make the host-side path resolve
-               (needed by NVIDIA's NVAPI/NGX loaders, harmless otherwise). */
-            driverstore_junction(dest_wide);
+            if (strcmp(si->share_name, "AppSandbox.Nvidia") == 0)
+                wcscpy_s(native_dir, MAX_PATH, dest_wide);
         }
         total_files += files;
 
@@ -1050,13 +639,6 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         if (state->notify_sock != NULL)
             send_line(state->notify_sock, msg);
     }
-
-    /* Provision the GL/CL/Vulkan mapping layers now — AFTER the GPU driver copy
-       but BEFORE the device disable/enable cycle, so the GL configuration (Mesa
-       opengl32 trio + dxil.dll in System32, Khronos OpenCL/Vulkan keys) is in
-       place when the GPU device is restarted below. */
-    if (gl_dir[0])
-        gl_provision(gl_dir);
 
     /* If files were copied and vrd.inf has error 43, restart GPU + IDD devices
        and re-disable Hyper-V Video adapter. */
@@ -1073,6 +655,11 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     } else {
         agent_log("All GPU driver files already present (pre-staged) - no copy or restart needed.");
     }
+
+    if (failed_shares == 0 && (gl_dir[0] || native_dir[0] || gpu_prefers_system_opengl()))
+        gl_provision(gl_dir, native_dir);
+    if (failed_shares == 0 && !nvidia_dlss_provision(native_dir))
+        failed_shares++;
 
     /* Send final result to host */
     if (failed_shares == 0) {

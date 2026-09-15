@@ -30,7 +30,7 @@
 #define EXT4_FIRST_INO         11u   /* s_first_ino: first non-reserved */
 
 /* Feature flags - kept very small. */
-#define EXT4_FEATURE_COMPAT     0
+#define EXT4_FEATURE_COMPAT     0x08u
 #define EXT4_FEATURE_INCOMPAT   (0x02u | 0x40u)   /* FILETYPE | EXTENTS */
 #define EXT4_FEATURE_RO_COMPAT  (0x01u | 0x02u | 0x08u | 0x20u | 0x40u)
                                  /* SPARSE_SUPER | LARGE_FILE | HUGE_FILE
@@ -225,6 +225,15 @@ typedef struct {
 /* sizeof = 0xa0 = 160. Inode-size 256 leaves 96 trailing bytes (xattrs). */
 
 typedef struct {
+    uint8_t  e_name_len;
+    uint8_t  e_name_index;
+    uint16_t e_value_offs;
+    uint32_t e_value_inum;
+    uint32_t e_value_size;
+    uint32_t e_hash;
+} ext4_xattr_entry_t;
+
+typedef struct {
     uint16_t eh_magic;
     uint16_t eh_entries;
     uint16_t eh_max;
@@ -291,6 +300,8 @@ typedef struct {
     /* For dirs only - serialized entry blob (filled at close). */
     uint8_t  *dir_blob;
     uint32_t  dir_blob_len;
+    void     *capability;
+    uint32_t  capability_size;
 } inode_rec_t;
 
 struct ext4_writer {
@@ -1022,6 +1033,29 @@ int ext4_writer_add_file(ext4_writer_t *w, const char *path,
     return 0;
 }
 
+int ext4_writer_set_capability(ext4_writer_t *w, const char *path,
+                               const void *data, size_t size)
+{
+    if (!data || (size != 12 && size != 20 && size != 24)) return -1;
+    dir_node_t *parent;
+    char leaf[256];
+    if (split_path(w, path, &parent, leaf, sizeof(leaf)) != 0) return -1;
+    for (dir_entry_rec_t *e = parent->entries; e; e = e->next) {
+        if (strcmp(e->name, leaf) != 0) continue;
+        if (e->file_type != EXT4_FT_REG_FILE) return -1;
+        inode_rec_t *r = w->inodes[e->inode];
+        void *copy = malloc(size);
+        if (!copy) return -1;
+        memcpy(copy, data, size);
+        free(r->capability);
+        r->capability = copy;
+        r->capability_size = (uint32_t)size;
+        r->body.i_extra_isize = (uint16_t)(sizeof(ext4_inode_t) - 128);
+        return 0;
+    }
+    return -1;
+}
+
 int ext4_writer_add_symlink(ext4_writer_t *w, const char *path,
                             const char *target, size_t target_len,
                             uint32_t uid, uint32_t gid, uint32_t mtime)
@@ -1232,6 +1266,22 @@ static int write_all_inodes(ext4_writer_t *w)
             memcpy(tbl + idx * INODE_SIZE,
                    &w->inodes[inode_num]->body,
                    sizeof(ext4_inode_t));
+            inode_rec_t *r = w->inodes[inode_num];
+            if (r->capability_size) {
+                uint8_t *inode = tbl + idx * INODE_SIZE;
+                uint32_t magic = 0xEA020000u;
+                memcpy(inode + sizeof(ext4_inode_t), &magic, sizeof(magic));
+                ext4_xattr_entry_t *entry = (ext4_xattr_entry_t *)(
+                    inode + sizeof(ext4_inode_t) + sizeof(magic));
+                entry->e_name_len = 10;
+                entry->e_name_index = 6;
+                entry->e_value_offs = (uint16_t)(INODE_SIZE - r->capability_size -
+                    sizeof(ext4_inode_t) - sizeof(magic));
+                entry->e_value_size = r->capability_size;
+                memcpy(entry + 1, "capability", entry->e_name_len);
+                memcpy(inode + INODE_SIZE - r->capability_size,
+                       r->capability, r->capability_size);
+            }
             any = 1;
         }
         if (!any) continue;
@@ -1474,6 +1524,7 @@ int ext4_writer_close(ext4_writer_t *w)
     for (uint32_t i = 1; i <= w->total_inodes; i++) {
         if (w->inodes[i]) {
             free(w->inodes[i]->dir_blob);
+            free(w->inodes[i]->capability);
             free(w->inodes[i]);
         }
     }

@@ -35,6 +35,7 @@
 int do_prefetch_build_deps(const wchar_t *codename,
                            const wchar_t *kernel_ver,
                            const wchar_t *out_dir,
-                           const wchar_t *mirror);
+                           const wchar_t *mirror,
+                           const wchar_t *iso_root);
 
 #endif /* PREFETCH_BUILD_DEPS_H */

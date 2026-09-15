@@ -3,7 +3,6 @@
  * Feature subset (deliberately small):
  *   INCOMPAT  : FILETYPE | EXTENTS
  *   RO_COMPAT : SPARSE_SUPER | LARGE_FILE | HUGE_FILE | DIR_NLINK | EXTRA_ISIZE
- *   No journal, no metadata_csum, no xattrs, no flex_bg, no 64bit, no HTREE.
  *
  * Layout:
  *   block_size       = 4096
@@ -47,6 +46,8 @@ int ext4_writer_add_dir(ext4_writer_t *w, const char *path,
 int ext4_writer_add_file(ext4_writer_t *w, const char *path,
                          uint16_t perms, uint32_t uid, uint32_t gid,
                          uint32_t mtime, const void *data, uint64_t size);
+int ext4_writer_set_capability(ext4_writer_t *w, const char *path,
+                               const void *data, size_t size);
 int ext4_writer_add_symlink(ext4_writer_t *w, const char *path,
                             const char *target, size_t target_len,
                             uint32_t uid, uint32_t gid, uint32_t mtime);

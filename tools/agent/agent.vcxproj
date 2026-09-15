@@ -156,11 +156,13 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="agent.c" />
+    <ClCompile Include="gl_vk_provision.c" />
     <ClCompile Include="p9copy.c" />
     <ClCompile Include="..\transport\asb_transport.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="p9copy.h" />
+    <ClInclude Include="gl_vk_provision.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

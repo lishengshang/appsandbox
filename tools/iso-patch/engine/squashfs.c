@@ -453,6 +453,143 @@ int sqfs_read_metadata_block(sqfs_ctx_t *ctx, uint64_t *off,
     return -1;
 }
 
+typedef struct {
+    uint64_t next_block;
+    uint64_t end;
+    size_t pos;
+    size_t len;
+    uint8_t data[SQFS_METADATA_SIZE];
+} sqfs_xattr_cursor_t;
+
+static int xattr_next_block(sqfs_ctx_t *ctx, sqfs_xattr_cursor_t *c)
+{
+    uint16_t hdr;
+    if (c->next_block >= c->end || c->end - c->next_block < 2 ||
+        sqfs_read_raw(ctx, c->next_block, &hdr, sizeof(hdr)) != 0 ||
+        (hdr & 0x7fff) > c->end - c->next_block - 2)
+        return -1;
+    if (sqfs_read_metadata_block(ctx, &c->next_block, c->data, &c->len) != 0 ||
+        c->len == 0 || (c->next_block != c->end && c->len != SQFS_METADATA_SIZE))
+        return -1;
+    c->pos = 0;
+    return 0;
+}
+
+static int xattr_cursor_start(sqfs_ctx_t *ctx, sqfs_xattr_cursor_t *c,
+                              uint64_t start, uint64_t end, size_t offset)
+{
+    if (end > ctx->sb.bytes_used || start >= end || offset >= SQFS_METADATA_SIZE)
+        return -1;
+    c->next_block = start;
+    c->end = end;
+    if (xattr_next_block(ctx, c) != 0 || offset >= c->len) return -1;
+    c->pos = offset;
+    return 0;
+}
+
+static int xattr_read(sqfs_ctx_t *ctx, sqfs_xattr_cursor_t *c,
+                       void *out, size_t size)
+{
+    uint8_t *p = (uint8_t *)out;
+    while (size) {
+        if (c->pos == c->len && xattr_next_block(ctx, c) != 0) return -1;
+        size_t n = c->len - c->pos;
+        if (n > size) n = size;
+        if (p) { memcpy(p, c->data + c->pos, n); p += n; }
+        c->pos += n;
+        size -= n;
+    }
+    return 0;
+}
+
+int sqfs_read_capability(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
+                         void **out_data, size_t *out_size)
+{
+    *out_data = NULL;
+    *out_size = 0;
+    if (entry->type != SQFS_EREG_TYPE || entry->_xattr_idx == UINT32_MAX)
+        return 0;
+
+    struct {
+        uint64_t start;
+        uint32_t count;
+        uint32_t unused;
+    } table;
+    struct {
+        uint64_t ref;
+        uint32_t count;
+        uint32_t size;
+    } id;
+    uint64_t table_off = ctx->sb.xattr_id_table_start;
+    if (table_off > ctx->sb.bytes_used ||
+        sizeof(table) > ctx->sb.bytes_used - table_off ||
+        sqfs_read_raw(ctx, table_off, &table, sizeof(table)) != 0 ||
+        entry->_xattr_idx >= table.count)
+        return -1;
+
+    uint64_t index_bytes = (((uint64_t)table.count * sizeof(id) +
+                            SQFS_METADATA_SIZE - 1) / SQFS_METADATA_SIZE) * 8;
+    table_off += sizeof(table);
+    if (index_bytes != ctx->sb.bytes_used - table_off) return -1;
+    uint64_t xattr_end, id_block;
+    uint64_t id_offset = (uint64_t)entry->_xattr_idx * sizeof(id);
+    if (sqfs_read_raw(ctx, table_off, &xattr_end, sizeof(xattr_end)) != 0 ||
+        sqfs_read_raw(ctx, table_off + (id_offset / SQFS_METADATA_SIZE) * 8,
+                      &id_block, sizeof(id_block)) != 0 ||
+        table.start < sizeof(sqfs_superblock_t) || table.start >= xattr_end ||
+        xattr_end > id_block || id_block >= ctx->sb.xattr_id_table_start)
+        return -1;
+
+    sqfs_xattr_cursor_t c;
+    if (xattr_cursor_start(ctx, &c, id_block, ctx->sb.xattr_id_table_start,
+                           (size_t)(id_offset % SQFS_METADATA_SIZE)) != 0 ||
+        xattr_read(ctx, &c, &id, sizeof(id)) != 0 ||
+        id.count == 0 ||
+        (id.ref >> 16) >= xattr_end - table.start ||
+        xattr_cursor_start(ctx, &c, table.start + (id.ref >> 16), xattr_end,
+                           (size_t)(id.ref & 0xffff)) != 0)
+        return -1;
+
+    for (uint32_t i = 0; i < id.count; i++) {
+        uint16_t attr[2];
+        char name[sizeof("capability") - 1];
+        uint32_t value_size;
+        if (xattr_read(ctx, &c, attr, sizeof(attr)) != 0 ||
+            attr[1] == 0 || (attr[0] & ~0x1ffu) != 0)
+            return -1;
+        int match = (attr[0] & 0xff) == 2 && attr[1] == sizeof(name);
+        if (xattr_read(ctx, &c, match ? name : NULL, attr[1]) != 0 ||
+            xattr_read(ctx, &c, &value_size, sizeof(value_size)) != 0 ||
+            ((attr[0] & 0x100) && value_size != sizeof(uint64_t)))
+            return -1;
+        if (!match || memcmp(name, "capability", sizeof(name)) != 0) {
+            if (xattr_read(ctx, &c, NULL, value_size) != 0) return -1;
+            continue;
+        }
+
+        if (attr[0] & 0x100) {
+            uint64_t ref;
+            if (xattr_read(ctx, &c, &ref, sizeof(ref)) != 0 ||
+                (ref >> 16) >= xattr_end - table.start ||
+                xattr_cursor_start(ctx, &c, table.start + (ref >> 16), xattr_end,
+                                   (size_t)(ref & 0xffff)) != 0 ||
+                xattr_read(ctx, &c, &value_size, sizeof(value_size)) != 0)
+                return -1;
+        }
+        if (value_size != 12 && value_size != 20 && value_size != 24) return -1;
+        void *value = malloc(value_size);
+        if (!value) return -1;
+        if (xattr_read(ctx, &c, value, value_size) != 0) {
+            free(value);
+            return -1;
+        }
+        *out_data = value;
+        *out_size = value_size;
+        return 0;
+    }
+    return 0;
+}
+
 /* ---- Inode + directory parsing ----
  *
  * All structs are stored little-endian. We use memcpy into local typed
@@ -688,6 +825,7 @@ static int walk_inode(walk_state_t *w, uint64_t inode_ref)
     e.gid   = id_lookup(ctx, hdr.gid_idx);
     e.mtime = hdr.mtime;
     e._file_inode_off = (size_t)(p - ctx->inode_stream.buf);
+    e._xattr_idx = UINT32_MAX;
 
     switch (hdr.type) {
     case SQFS_DIR_TYPE: {
@@ -730,6 +868,7 @@ static int walk_inode(walk_state_t *w, uint64_t inode_ref)
         sqfs_ext_file_t f;
         memcpy(&f, body, sizeof(f));
         e.size = f.file_size;
+        e._xattr_idx = f.xattr_idx;
         if (w->cb_rc == 0) w->cb_rc = w->cb(&e, w->user);
         w->n_files++;
         return w->cb_rc;

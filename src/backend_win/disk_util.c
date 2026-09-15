@@ -2111,6 +2111,7 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
                mutable profile data: the agent seeds it with guest permissions
                and excludes the host's runtime lock file. */
             if (_wcsicmp(ds->share_name, L"AppSandbox.GlLayers") == 0 ||
+                _wcsicmp(ds->share_name, L"AppSandbox.Nvidia") == 0 ||
                 _wcsicmp(ds->share_name, L"AppSandbox.NvidiaDrs") == 0)
                 continue;
             /* Strip "C:" or any drive prefix — keep the leading backslash */

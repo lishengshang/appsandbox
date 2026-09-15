@@ -10,6 +10,7 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 
@@ -475,6 +476,74 @@ BOOL gpu_get_driver_shares(GpuList *gpu_list, GpuDriverShareList *out)
     return FALSE;
 }
 
+BOOL gpu_append_amd_gl_vk_driver_shares(const GpuList *gpu_list, GpuDriverShareList *list)
+{
+    HDEVINFO devices;
+    SP_DEVINFO_DATA device;
+    DWORD index;
+    BOOL found = FALSE;
+    int i;
+
+    if (!gpu_list || !list) return FALSE;
+    for (i = 0; i < gpu_list->count; i++) {
+        if (_wcsnicmp(gpu_list->gpus[i].instance_path, L"PCI\\VEN_1002&", 13) == 0)
+            break;
+    }
+    if (i == gpu_list->count) return FALSE;
+
+    devices = SetupDiGetClassDevsW(&GUID_DEVCLASS_SOFTWARECOMPONENT, NULL, NULL,
+                                    DIGCF_PRESENT);
+    if (devices == INVALID_HANDLE_VALUE) return FALSE;
+
+    device.cbSize = sizeof(device);
+    for (index = 0; SetupDiEnumDeviceInfo(devices, index, &device); index++) {
+        wchar_t inf_name[MAX_PATH], store_path[MAX_PATH], guest[MAX_PATH];
+        wchar_t parent_id[512];
+        wchar_t *slash;
+        DEVINST parent;
+        DWORD size = sizeof(inf_name), attributes;
+        HKEY key;
+        LSTATUS result;
+
+        if (CM_Get_Parent(&parent, device.DevInst, 0) != CR_SUCCESS ||
+            CM_Get_Device_IDW(parent, parent_id, 512, 0) != CR_SUCCESS)
+            continue;
+        for (i = 0; i < gpu_list->count; i++) {
+            if (_wcsnicmp(gpu_list->gpus[i].instance_path, L"PCI\\VEN_1002&", 13) == 0 &&
+                _wcsicmp(gpu_list->gpus[i].instance_path, parent_id) == 0)
+                break;
+        }
+        if (i == gpu_list->count) continue;
+
+        key = SetupDiOpenDevRegKey(devices, &device,
+            DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_READ);
+        if (key == INVALID_HANDLE_VALUE) continue;
+        result = RegGetValueW(key, NULL, L"InfPath", RRF_RT_REG_SZ,
+                              NULL, inf_name, &size);
+        RegCloseKey(key);
+        if (result != ERROR_SUCCESS || !inf_name[0]) continue;
+        if (!SetupGetInfDriverStoreLocationW(inf_name, NULL, NULL,
+                                              store_path, MAX_PATH, NULL))
+            continue;
+        slash = wcsrchr(store_path, L'\\');
+        if (!slash || (_wcsicmp(slash + 1, L"amdogl.inf") != 0 &&
+                       _wcsicmp(slash + 1, L"amdvlk.inf") != 0))
+            continue;
+        *slash = L'\0';
+        if (wcslen(store_path) + 4 >= MAX_PATH) continue;
+        attributes = GetFileAttributesW(store_path);
+        if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+
+        make_guest_path(store_path, TRUE, guest, MAX_PATH);
+        if (!add_share_unique(list, store_path, guest, NULL)) break;
+        found = TRUE;
+    }
+
+    SetupDiDestroyDeviceInfoList(devices);
+    return found;
+}
+
 BOOL gpu_append_nvidia_drs_share(const GpuList *gpu_list, GpuDriverShareList *list)
 {
     wchar_t base[MAX_PATH], path[MAX_PATH];
@@ -529,6 +598,70 @@ BOOL gpu_append_nvidia_drs_share(const GpuList *gpu_list, GpuDriverShareList *li
     s->file_filter[0] = L'\0';
     list->count++;
     return TRUE;
+}
+
+BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverShareList *list)
+{
+#if defined(_M_X64)
+    static const wchar_t *const additional[] = {
+        L"appsandbox-nvidia-vk-gl-shim32.dll",
+        L"appsandbox-nvidia-dlss-shim.dll"
+    };
+    wchar_t exe[MAX_PATH], path[MAX_PATH], file[MAX_PATH], *slash;
+    GpuDriverShare *share;
+    DWORD length, attributes;
+    int i;
+
+    if (!gpu_list || !list) return FALSE;
+    for (i = 0; i < gpu_list->count; i++) {
+        if (_wcsicmp(gpu_list->gpus[i].service, L"nvlddmkm") == 0)
+            break;
+    }
+    if (i == gpu_list->count) return FALSE;
+    for (i = 0; i < list->count; i++) {
+        if (_wcsicmp(list->shares[i].share_name, L"AppSandbox.Nvidia") == 0)
+            return TRUE;
+    }
+    if (list->count >= MAX_GPU_SHARES) return FALSE;
+
+    length = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (!length || length >= MAX_PATH) return FALSE;
+    slash = wcsrchr(exe, L'\\');
+    if (!slash) return FALSE;
+    *slash = 0;
+    if (wcslen(exe) + wcslen(L"\\resources\\nvidia\\appsandbox-nvidia-vk-gl-shim32.dll") >= MAX_PATH)
+        return FALSE;
+    swprintf_s(path, MAX_PATH, L"%s\\resources\\nvidia", exe);
+    swprintf_s(file, MAX_PATH, L"%s\\appsandbox-nvidia-vk-gl-shim.dll", path);
+    attributes = GetFileAttributesW(file);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        swprintf_s(path, MAX_PATH, L"%s\\nvidia", exe);
+        swprintf_s(file, MAX_PATH, L"%s\\appsandbox-nvidia-vk-gl-shim.dll", path);
+        attributes = GetFileAttributesW(file);
+    }
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return FALSE;
+
+    share = &list->shares[list->count];
+    wcscpy_s(share->share_name, 128, L"AppSandbox.Nvidia");
+    wcscpy_s(share->host_path, MAX_PATH, path);
+    wcscpy_s(share->guest_path, MAX_PATH, L"C:\\Windows\\AppSandbox\\nvidia");
+    wcscpy_s(share->file_filter, 4096, L"appsandbox-nvidia-vk-gl-shim.dll");
+    for (i = 0; i < ARRAYSIZE(additional); i++) {
+        swprintf_s(file, MAX_PATH, L"%s\\%s", path, additional[i]);
+        attributes = GetFileAttributesW(file);
+        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            wcscat_s(share->file_filter, 4096, L";");
+            wcscat_s(share->file_filter, 4096, additional[i]);
+        }
+    }
+    list->count++;
+    return TRUE;
+#else
+    (void)gpu_list;
+    (void)list;
+    return FALSE;
+#endif
 }
 
 BOOL gpu_append_lxsslib_share(GpuDriverShareList *list)

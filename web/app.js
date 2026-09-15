@@ -4,9 +4,9 @@
 /* ---- State ---- */
 let vms = [];
 let selectedVm = -1;
-let selectedSnap = {};  /* vmIndex -> string value: 'current', 'base', 'base-N', 'S', 'S-N' */
-let editModeRow = -1;
-let editingCell = null; /* {row, col, element} */
+let selectedSnap = new Map();
+let editVmState = null;
+let snapshotModal = null;
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
 let lastHostInfo = null;
@@ -77,7 +77,7 @@ function sendCmd(action, data) { hostBridge.send(action, data); }
  * Per-OS field visibility — including the .needs-iso picker — is driven by
  * applyOsTypeUI(), which runs on both hosts. */
 if (hostBridge.isMac) {
-    var hide = document.querySelectorAll('.win-only, .needs-linux-version');
+    var hide = document.querySelectorAll('.win-only, .windows-host-only, .needs-linux-version');
     for (var i = 0; i < hide.length; i++) hide[i].style.display = 'none';
 }
 
@@ -135,7 +135,7 @@ window.onHostMessage = function(msg) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': vms = msg.vms; renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
+        case 'vmListChanged': updateVmList(msg.vms); renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
@@ -165,7 +165,7 @@ if (hostBridge.isWebView2) {
 /* ---- Initial state ---- */
 
 function onFullState(msg) {
-    vms = msg.vms || [];
+    updateVmList(msg.vms || []);
     renderVmTable();
     revalidateVmName();
     if (msg.hostInfo) updateHostInfo(msg.hostInfo);
@@ -213,6 +213,8 @@ function updateHostInfo(info) {
     if (el) el.textContent = 'Host: ' + info.hostCores + ' cores | VMs using: ' + info.vmCores;
     el = document.getElementById('host-ram');
     if (el) el.textContent = 'Host: ' + info.hostRamMb + ' MB | VMs using: ' + info.vmRamMb + ' MB';
+    document.getElementById('edit-host-cpu').textContent = document.getElementById('host-cpu').textContent;
+    document.getElementById('edit-host-ram').textContent = document.getElementById('host-ram').textContent;
     if (previousDefault !== info.defaultDiskDirectory) refreshDiskSpaceInfo();
     else {
         updateDiskSpaceInfo();
@@ -269,7 +271,6 @@ function onDiskSpace(msg) {
 /* ---- Adapters ---- */
 
 var currentAdapters = [];
-var currentDefaultAdapter = '';
 
 function populateAdapters(adapters, defaultIdx) {
     var sel = document.getElementById('net-adapter');
@@ -285,9 +286,6 @@ function populateAdapters(adapters, defaultIdx) {
     }
     if (typeof defaultIdx === 'number' && defaultIdx >= 0 && defaultIdx < sel.options.length) {
         sel.selectedIndex = defaultIdx;
-        currentDefaultAdapter = sel.value;
-    } else if (adapters && adapters.length > 0) {
-        currentDefaultAdapter = adapters[0];
     }
 }
 
@@ -576,7 +574,7 @@ function hidePassword() {
 function onNetModeChange() {
     /* Adapter dropdown only relevant for External */
     var mode = parseInt(document.getElementById('net-mode').value);
-    var show = (mode === 2) ? '' : 'none';
+    var show = (!hostBridge.isMac && mode === 2) ? '' : 'none';
     document.getElementById('net-adapter').style.display = show;
     document.getElementById('net-adapter-label').style.display = show;
 }
@@ -602,8 +600,8 @@ function gatherConfig() {
         ramMb:       alignRamMb(document.getElementById('ram-size').valueAsNumber),
         cpuCores:    document.getElementById('cpu-cores').valueAsNumber,
         gpuMode:     parseInt(document.getElementById('gpu-mode').value),
-        networkMode: parseInt(document.getElementById('net-mode').value),
-        netAdapter:  document.getElementById('net-adapter').value,
+        networkMode: hostBridge.isMac ? 1 : parseInt(document.getElementById('net-mode').value),
+        netAdapter:  hostBridge.isMac ? '' : document.getElementById('net-adapter').value,
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
         adminConfirm: document.getElementById('admin-confirm').value,
@@ -852,6 +850,21 @@ document.addEventListener('keydown', function(e) {
         } else trapModalFocus(e, diskOverlay);
         return;
     }
+    var editOverlay = document.getElementById('edit-vm-overlay');
+    if (editOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); closeEditVmModal(); }
+        else if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+            e.preventDefault();
+            saveEditVm();
+        } else trapModalFocus(e, editOverlay);
+        return;
+    }
+    var snapshotOverlay = document.getElementById('snapshot-overlay');
+    if (snapshotOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); closeSnapshotModal(); }
+        else trapModalFocus(e, snapshotOverlay);
+        return;
+    }
     if (e.key !== 'Escape') return;
     if (document.getElementById('create-vm-overlay').classList.contains('active')) {
         closeCreateModal();
@@ -944,7 +957,6 @@ function buildRowCells(vm, i, statusTd) {
                 : 'In-VM agent is not connected'));
 
     var bld = vm.buildingVhdx;
-    var snapVal = selectedSnap[i] || 'current';
 
     var sshActive = vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !bld;
     var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
@@ -958,49 +970,37 @@ function buildRowCells(vm, i, statusTd) {
     }
 
     var cells = [
-        makeCell(vm.name, i, 0),
-        makeCell(vm.osType, i, 1),
+        makeCell(vm.name),
+        makeCell(vm.osType),
         statusTd,
         agentTd,
-        makeCell(vm.cpuCores, i, 4, 'Number of virtual CPU cores assigned to this VM'),
-        makeCell(vm.ramMb + ' MB', i, 5, 'Memory allocated to this VM, in megabytes'),
-        makeCell(vm.hddGb + ' GB', i, 6, 'Virtual disk size, in gigabytes'),
-        makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'), i, 7, 'GPU passed through to the VM via GPU-PV, or None'),
-        makeCell(netNames[vm.networkMode] || 'None', i, 8, 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+        makeCell(vm.cpuCores, 'Number of virtual CPU cores assigned to this VM'),
+        makeCell(vm.ramMb + ' MB', 'Memory allocated to this VM, in megabytes'),
+        makeCell(vm.hddGb + ' GB', 'Virtual disk size, in gigabytes'),
+        makeCell(vm.gpuName || (vm.gpuMode === 2 ? 'Try all' : vm.gpuMode === 1 ? 'Default GPU' : 'None'),
+            hostBridge.isMac && vm.osType === 'Windows'
+                ? 'Windows software rendering (WARP) on the CPU'
+                : 'GPU passed through to the VM via GPU-PV, or None'),
+        makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
+            hostBridge.isMac ? 'NAT (shared networking)'
+                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
-        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, (function(vmIdx, sv, vmObj) { return function() {
-            var p = parseSnapValue(sv);
-            if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
-                /* Creating a new branch — prompt for name */
-                var parentName = p.snapIndex === -2 ? 'Base' : ((vmObj.snapshots && vmObj.snapshots[p.snapIndex]) ? vmObj.snapshots[p.snapIndex].name : 'Snapshot');
-                var now = new Date();
-                var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
-                var defaultName = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
-                showModal('New Branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the base snapshot.', 'Boot', {
-                    confirmClass: 'primary',
-                    input: { label: 'Branch name:', value: defaultName }
-                }).then(function(result) {
-                    if (result === false) return;
-                    selectedSnap[vmIdx] = 'current';
-                    sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex, branchName: result });
-                });
-            } else {
-                sendCmd('startVm', { vmIndex: vmIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
-            }
-        }; })(i, snapVal, vm), '', 'Start the VM (boots from the selected snapshot/branch)'),
+        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(i); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
         makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
+        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration — VM must be stopped'),
     );
     return cells;
 }
 
 function renderVmTable() {
+    updateEditVmModal();
+    renderSnapshotModal();
     var tbody = document.getElementById('vm-tbody');
 
     if (vms.length === 0) {
@@ -1055,13 +1055,13 @@ function renderVmTable() {
         updateStatusCell(statusTd, vm);
 
         var sig = [
-            i === selectedVm, editModeRow === i,
+            i, i === selectedVm,
             vm.running, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuName, vm.networkMode,
-            selectedSnap[i] || 'current',
+            selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
                actions (never on install-progress ticks — a VM can't be snapshotted
@@ -1082,7 +1082,6 @@ function renderVmTable() {
                        (vm.running ? 'running' : 'stopped');
         tr.onclick = function(e) {
             if (e.target.closest('.icon-btn')) return;
-            if (e.target.closest('.editing')) return;
             if (e.target.closest('.snap-cell')) return;
             selectVm(i);
         };
@@ -1104,20 +1103,10 @@ function renderVmTable() {
     });
 }
 
-function makeCell(text, row, col, title) {
+function makeCell(text, title) {
     var td = document.createElement('td');
     td.textContent = text;
     if (title) td.title = title;
-
-    /* Editable columns: 4=CPU, 5=RAM, 7=GPU, 8=Network */
-    if (editModeRow === row && (col === 4 || col === 5 || col === 7 || col === 8)) {
-        td.style.cursor = 'pointer';
-        td.title = 'Click to edit';
-        td.onclick = function(e) {
-            e.stopPropagation();
-            startInlineEdit(row, col, td);
-        };
-    }
     return td;
 }
 
@@ -1137,110 +1126,128 @@ function makeIconCell(cls, icon, active, handler, extraClass, title) {
 /* ---- VM Selection ---- */
 
 function selectVm(idx) {
-    if (editingCell) commitInlineEdit();
-    if (editModeRow >= 0 && editModeRow !== idx) editModeRow = -1;
     selectedVm = idx;
     renderVmTable();
     sendCmd('selectVm', { vmIndex: idx });
 }
 
-/* ---- Inline Editing ---- */
-
-function toggleEditMode(row) {
-    if (editingCell) commitInlineEdit();
-    if (vms[row] && vms[row].running) return;
-    editModeRow = (editModeRow === row) ? -1 : row;
-    renderVmTable();
+function updateVmList(next) {
+    selectedSnap.forEach(function(value, name) {
+        var before = vms.find(function(vm) { return vm.name === name; });
+        var after = next.find(function(vm) { return vm.name === name; });
+        if (!before || !after || snapshotTreeSignature(before) !== snapshotTreeSignature(after))
+            selectedSnap.delete(name);
+    });
+    vms = next;
 }
 
-function startInlineEdit(row, col, td) {
-    if (editingCell) commitInlineEdit();
-    var vm = vms[row];
-    if (!vm || vm.running) return;
-
-    var oldValue;
-    /* Lock cell width before swapping content to prevent column resize */
-    var cellWidth = td.getBoundingClientRect().width;
-    td.style.width = cellWidth + 'px';
-    td.style.maxWidth = cellWidth + 'px';
-    td.classList.add('editing');
-
-    if (col === 7) {
-        /* GPU combo */
-        var sel = document.createElement('select');
-        sel.innerHTML = '<option value="0">None</option><option value="1">Default GPU</option><option value="2">Try all</option>';
-        sel.value = String(vm.gpuMode);
-        sel.onclick = function(e) { e.stopPropagation(); };
-        sel.onchange = function() { commitInlineEdit(); };
-        sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
-        td.textContent = '';
-        td.appendChild(sel);
-        editingCell = { row: row, col: col, element: sel };
-        sel.focus();
-        setTimeout(function() { try { sel.showPicker(); } catch(e) {} }, 0);
-    } else if (col === 8) {
-        /* Network combo */
-        var sel = document.createElement('select');
-        sel.innerHTML = '<option value="0">None</option><option value="1">NAT</option><option value="2">External</option><option value="3">Internal</option>';
-        sel.value = String(vm.networkMode);
-        sel.onclick = function(e) { e.stopPropagation(); };
-        sel.onchange = function() { commitInlineEdit(); };
-        sel.onblur = function() { setTimeout(commitInlineEdit, 100); };
-        td.textContent = '';
-        td.appendChild(sel);
-        editingCell = { row: row, col: col, element: sel };
-        sel.focus();
-        setTimeout(function() { try { sel.showPicker(); } catch(e) {} }, 0);
-    } else {
-        /* Text/number input */
-        var inp = document.createElement('input');
-        inp.type = 'number';
-        inp.value = col === 4 ? String(vm.cpuCores) : String(vm.ramMb);
-        inp.onkeydown = function(e) {
-            if (e.key === 'Enter') commitInlineEdit();
-            else if (e.key === 'Escape') cancelInlineEdit();
-        };
-        inp.onblur = function() { commitInlineEdit(); };
-        td.textContent = '';
-        td.appendChild(inp);
-        inp.select();
-        inp.focus();
-        editingCell = { row: row, col: col, element: inp };
-    }
+function vmIndexByName(name) {
+    return vms.findIndex(function(vm) { return vm.name === name; });
 }
 
-function commitInlineEdit() {
-    if (!editingCell) return;
-    var el = editingCell.element;
-    var row = editingCell.row;
-    var col = editingCell.col;
-    var value = el.value;
-    editingCell = null;
+function openEditVmModal(idx) {
+    var vm = vms[idx];
+    if (!vm || vm.running || vm.buildingVhdx) return;
+    editVmState = { name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.name].querySelector('.edit') };
+    document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
+    document.getElementById('edit-ram-size').value = vm.ramMb;
+    document.getElementById('edit-ram-size').min = hostBridge.isMac ? 512 : 4000;
+    document.getElementById('edit-cpu-cores').value = vm.cpuCores;
+    document.getElementById('edit-gpu-mode').value = String(vm.gpuMode);
+    document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    updateEditVmModal();
+    document.getElementById('edit-vm-overlay').classList.add('active');
+    document.getElementById('edit-ram-size').focus();
+}
 
-    var field;
-    if (col === 4) field = 'cpuCores';
-    else if (col === 5) field = 'ramMb';
-    else if (col === 7) field = 'gpuMode';
-    else if (col === 8) field = 'networkMode';
+function closeEditVmModal() {
+    document.getElementById('edit-vm-overlay').classList.remove('active');
+    restoreVmModalFocus(editVmState, '.edit');
+    editVmState = null;
+}
 
-    /* RAM must be 2 MB-aligned (HCS requirement): round an odd entry down by 1. */
-    if (field === 'ramMb') {
-        var mb = parseInt(value, 10);
-        if (!isNaN(mb)) value = String(alignRamMb(mb));
+function restoreVmModalFocus(state, selector) {
+    if (!state) return;
+    var target = state.previousFocus;
+    if (!target || !target.isConnected || target.disabled) {
+        var row = rowCache[state.name];
+        target = row && row.querySelector(selector);
     }
+    if (!target || !target.isConnected || target.disabled) target = document.getElementById('btn-new-sandbox');
+    target.focus();
+}
 
-    if (field) {
-        sendCmd('editVm', { vmIndex: row, field: field, value: value });
-        if (field === 'networkMode' && value === '2' && currentDefaultAdapter) {
-            sendCmd('editVm', { vmIndex: row, field: 'netAdapter', value: currentDefaultAdapter });
+function editVmValues() {
+    var values = {
+        ramMb: document.getElementById('edit-ram-size').valueAsNumber,
+        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber
+    };
+    if (!hostBridge.isMac) {
+        values.gpuMode = Number(document.getElementById('edit-gpu-mode').value);
+        values.networkMode = Number(document.getElementById('edit-net-mode').value);
+    }
+    return values;
+}
+
+function editVmValidationError(values) {
+    if (!Number.isInteger(values.cpuCores) || values.cpuCores < 1 || values.cpuCores > 2147483647)
+        return 'CPU cores must be a whole number of at least 1.';
+    var minRam = hostBridge.isMac ? 512 : 4000;
+    if (values.ramMb !== editVmState.initial.ramMb &&
+        (!Number.isInteger(values.ramMb) || values.ramMb < minRam || values.ramMb > 2147483647))
+        return 'RAM must be a whole number of at least ' + minRam + ' MB.';
+    return '';
+}
+
+function updateEditVmModal() {
+    if (!editVmState) return;
+    var vm = vms[vmIndexByName(editVmState.name)];
+    if (!vm) { closeEditVmModal(); return; }
+    var disabled = vm.running || vm.buildingVhdx;
+    document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
+        el.disabled = !!disabled;
+    });
+    var values = editVmValues();
+    var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
+    document.getElementById('edit-vm-warn').textContent = error;
+    document.getElementById('btn-save-edit-vm').disabled = !!error;
+}
+
+function saveEditVm() {
+    if (!editVmState) return;
+    updateEditVmModal();
+    if (!editVmState || document.getElementById('btn-save-edit-vm').disabled) return;
+    var idx = vmIndexByName(editVmState.name);
+    var values = editVmValues();
+    if (values.ramMb !== editVmState.initial.ramMb) values.ramMb = alignRamMb(values.ramMb);
+    var fields = Object.keys(values).filter(function(field) {
+        return values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
+    });
+    closeEditVmModal();
+    fields.forEach(function(field) {
+        sendCmd('editVm', { vmIndex: idx, field: field, value: String(values[field]) });
+    });
+}
+
+document.getElementById('edit-vm-overlay').addEventListener('input', updateEditVmModal);
+document.getElementById('edit-vm-overlay').addEventListener('change', updateEditVmModal);
+document.getElementById('edit-ram-size').addEventListener('change', function() {
+    if (Number.isInteger(this.valueAsNumber)) this.value = alignRamMb(this.valueAsNumber);
+    updateEditVmModal();
+});
+
+['edit-vm-overlay', 'snapshot-overlay'].forEach(function(id) {
+    var backdropPress = false;
+    var overlay = document.getElementById(id);
+    overlay.addEventListener('mousedown', function(e) { backdropPress = e.target === overlay; });
+    overlay.addEventListener('click', function(e) {
+        if (backdropPress && e.target === overlay) {
+            if (id === 'edit-vm-overlay') closeEditVmModal();
+            else closeSnapshotModal();
         }
-    }
-}
-
-function cancelInlineEdit() {
-    editingCell = null;
-    renderVmTable();
-}
+        backdropPress = false;
+    });
+});
 
 /* ---- Force Stop VM ---- */
 
@@ -1314,237 +1321,264 @@ function parseSnapValue(val) {
     return {snapIndex: parseInt(parts[0]), branchIndex: parseInt(parts[1])};
 }
 
+function snapshotTreeSignature(vm) {
+    return JSON.stringify([vm.hasSnapshots, vm.baseBranches || [], vm.snapshots || []]);
+}
+
+function snapshotSelection(vm, value) {
+    var p = value === 'current' ? { snapIndex: vm.snapCurrent, branchIndex: vm.snapCurrentBranch } : parseSnapValue(value);
+    var snap = p.snapIndex >= 0 && (vm.snapshots || [])[p.snapIndex];
+    var branches = snap ? snap.branches || [] : vm.baseBranches || [];
+    var branch = p.branchIndex >= 0 && branches[p.branchIndex];
+    return { snapIndex: p.snapIndex, branchIndex: p.branchIndex, snapshot: snap, branch: branch };
+}
+
+function snapshotRowValue(vm, value) {
+    var p = snapshotSelection(vm, value);
+    if (p.branch) return (p.snapIndex === -2 ? 'base-' : p.snapIndex + '-') + p.branchIndex;
+    if (p.snapshot) return String(p.snapIndex);
+    return 'base';
+}
+
+function snapshotPath(vm, value) {
+    var p = snapshotSelection(vm, value);
+    var path = 'Base';
+    if (p.snapshot) path += ' \u2192 ' + p.snapshot.name;
+    if (p.branch) path += ' \u2192 ' + (p.branch.name || 'branch ' + (p.branchIndex + 1));
+    if (value !== 'current' && p.branchIndex < 0) path += ' [new branch]';
+    return path;
+}
+
 function makeSnapCell(vm, vmIdx) {
     var td = document.createElement('td');
     td.className = 'snap-cell';
-    var snaps = vm.snapshots || [];
-    var baseBranches = vm.baseBranches || [];
-    var curSnap = vm.snapCurrent;       /* -2=base, -1=pre-snapshot, >=0=snapshot index */
-    var curBranch = vm.snapCurrentBranch; /* branch index or -1 */
-    var hasSn = vm.hasSnapshots;
-    var sel = selectedSnap[vmIdx] || 'current';
+    var button = document.createElement('button');
+    button.className = 'snap-open';
+    button.textContent = vm.hasSnapshots ? snapshotPath(vm, selectedSnap.get(vm.name) || 'current') : 'No snapshots';
+    button.title = 'Snapshots — ' + button.textContent;
+    button.setAttribute('aria-haspopup', 'dialog');
+    button.onclick = function(e) { e.stopPropagation(); openSnapshotModal(vmIdx); };
+    td.appendChild(button);
+    return td;
+}
 
-    var snapWrap = document.createElement('span');
-    snapWrap.className = 'snap-wrap';
-
-    var select = document.createElement('select');
-    select.className = 'snap-select';
-    select.disabled = vm.running;
-
-    function addOpt(value, text, selected) {
-        var o = document.createElement('option');
-        o.value = value;
-        o.textContent = text;
-        if (selected) o.selected = true;
-        select.appendChild(o);
-    }
-
-    if (!hasSn) {
-        addOpt('current', 'No snapshots', true);
-    } else {
-        /*  Tree with multiple branches per node:
-         *    Current (base, branch 1)
-         *    \u251C Base                       <- new branch
-         *    \u2502 \u251C branch 1 (date)     <- resume
-         *    \u2502 \u2514 branch 2 (date)     <- resume
-         *    \u251C Snapshot A (date)           <- new branch
-         *    \u2502 \u2514 branch 1 (date)     <- resume
-         *    \u2514 Snapshot B (date)           <- new branch
-         */
-
-        /* "Current" — resume whatever is active */
-        addOpt('current', 'Current', sel === 'current');
-
-        /* Base + its branches */
-        addOpt('base', '\u251C Base [create new child branch]', sel === 'base');
-        baseBranches.forEach(function(br, b) {
-            var brChar = (b === baseBranches.length - 1) ? '\u2514' : '\u251C';
-            var label = '\u2502\u00A0\u00A0' + brChar + ' ' + (br.name || 'branch ' + (b + 1));
-            if (br.date) label += ' (' + br.date + ')';
-            if (br.sizeGb) label += ' [' + br.sizeGb + ' GB]';
-            addOpt('base-' + b, label, sel === 'base-' + b);
-        });
-
-        /* Snapshots + their branches */
-        snaps.forEach(function(snap, i) {
-            var isLast = (i === snaps.length - 1);
-            var treePfx = isLast ? '\u2514 ' : '\u251C ';
-            var contPfx = isLast ? '\u00A0\u00A0\u00A0' : '\u2502\u00A0\u00A0';
-            var branches = snap.branches || [];
-
-            addOpt(String(i), treePfx + snap.name + ' (' + snap.date + ') [create new child branch]', sel === String(i));
-
-            branches.forEach(function(br, b) {
-                var brChar = (b === branches.length - 1) ? '\u2514' : '\u251C';
-                var label = contPfx + brChar + ' ' + (br.name || 'branch ' + (b + 1));
-                if (br.date) label += ' (' + br.date + ')';
-                if (br.sizeGb) label += ' [' + br.sizeGb + ' GB]';
-                addOpt(i + '-' + b, label, sel === i + '-' + b);
-            });
-        });
-    }
-
-    select.onchange = function(e) {
-        e.stopPropagation();
-        selectedSnap[vmIdx] = select.value;
-        renderVmTable();
+function openSnapshotModal(idx) {
+    var vm = vms[idx];
+    if (!vm || hostBridge.isMac) return;
+    var value = selectedSnap.get(vm.name) || 'current';
+    snapshotModal = {
+        name: vm.name,
+        currentRow: snapshotRowValue(vm, value),
+        currentPath: snapshotPath(vm, value),
+        selectedValue: null,
+        treeSignature: snapshotTreeSignature(vm),
+        previousFocus: rowCache[vm.name].querySelector('.snap-open'),
+        signature: null
     };
-    snapWrap.appendChild(select);
+    document.getElementById('snapshot-title').textContent = 'Snapshots — ' + vm.name;
+    document.getElementById('snapshot-warn').textContent = '';
+    renderSnapshotModal();
+    document.getElementById('snapshot-overlay').classList.add('active');
+    var choice = document.querySelector('#snapshot-tree [aria-pressed="true"]:not(:disabled)');
+    (choice || document.querySelector('#snapshot-overlay .modal-buttons button:last-child')).focus();
+}
 
-    /* Chain overlay — shows selected path when dropdown is closed */
-    if (hasSn) {
-        var p = parseSnapValue(sel);
-        var chainText = '';
-        if (sel === 'current') {
-            /* Show the currently active chain */
-            if (curSnap >= 0 && snaps[curSnap]) {
-                chainText = 'base \u2192 ' + snaps[curSnap].name;
-                if (curBranch >= 0 && snaps[curSnap].branches && snaps[curSnap].branches[curBranch])
-                    chainText += ' \u2192 ' + (snaps[curSnap].branches[curBranch].name || 'branch ' + (curBranch + 1));
-            } else if (curSnap === -2) {
-                chainText = 'base';
-                if (curBranch >= 0 && baseBranches[curBranch])
-                    chainText += ' \u2192 ' + (baseBranches[curBranch].name || 'branch ' + (curBranch + 1));
-            } else {
-                chainText = 'base';
-            }
-        } else if (p.snapIndex === -2) {
-            chainText = 'base';
-            if (p.branchIndex >= 0 && baseBranches[p.branchIndex])
-                chainText += ' \u2192 ' + (baseBranches[p.branchIndex].name || 'branch ' + (p.branchIndex + 1));
-            else
-                chainText += ' [create new child branch]';
-        } else if (p.snapIndex >= 0 && snaps[p.snapIndex]) {
-            chainText = 'base \u2192 ' + snaps[p.snapIndex].name;
-            if (p.branchIndex >= 0 && snaps[p.snapIndex].branches && snaps[p.snapIndex].branches[p.branchIndex])
-                chainText += ' \u2192 ' + (snaps[p.snapIndex].branches[p.branchIndex].name || 'branch ' + (p.branchIndex + 1));
-            else
-                chainText += ' [create new child branch]';
-        }
-        var overlay = document.createElement('span');
-        overlay.className = 'snap-overlay';
-        overlay.textContent = chainText;
-        snapWrap.appendChild(overlay);
+function closeSnapshotModal() {
+    document.getElementById('snapshot-overlay').classList.remove('active');
+    restoreVmModalFocus(snapshotModal, '.snap-open');
+    snapshotModal = null;
+}
+
+function renderSnapshotModal() {
+    if (!snapshotModal) return;
+    var vm = vms[vmIndexByName(snapshotModal.name)];
+    if (!vm) { closeSnapshotModal(); return; }
+    var value = selectedSnap.get(vm.name) || 'current';
+    var disabled = !!(vm.running || vm.buildingVhdx);
+    var treeSignature = snapshotTreeSignature(vm);
+    if (treeSignature !== snapshotModal.treeSignature) {
+        snapshotModal.currentRow = snapshotRowValue(vm, value);
+        snapshotModal.currentPath = snapshotPath(vm, value);
+        snapshotModal.selectedValue = null;
+        snapshotModal.treeSignature = treeSignature;
     }
-    td.appendChild(snapWrap);
+    var signature = [treeSignature, vm.snapCurrent, vm.snapCurrentBranch, value, snapshotModal.selectedValue, disabled].join('|');
+    if (signature === snapshotModal.signature) return;
+    snapshotModal.signature = signature;
+    var tree = document.getElementById('snapshot-tree');
+    var focusedValue = tree.contains(document.activeElement) ? document.activeElement.value : null;
+    tree.textContent = '';
+    var list = document.createElement('ul');
+    tree.appendChild(list);
+    var p = snapshotSelection(vm, value);
+    var currentRow = snapshotModal.currentRow;
+    var selectedRow = snapshotRowValue(vm, value);
+    document.getElementById('snapshot-current').textContent = 'Current: ' + snapshotModal.currentPath;
+    document.getElementById('snapshot-help').textContent = disabled
+        ? 'Stop the VM to select a different disk or manage snapshots.'
+        : !vm.hasSnapshots ? 'No snapshots. This VM uses its original disk.'
+        : value === 'current' ? 'The next start resumes the current disk. A frozen disk will start in a new branch.'
+        : p.branch ? 'The next start resumes this branch.'
+        : 'The next start creates a new branch from this disk.';
 
-    /* Take snapshot button — only when stopped */
-    var takeBtn = document.createElement('button');
-    takeBtn.className = 'snap-btn';
-    takeBtn.textContent = '+';
-    takeBtn.title = 'Take snapshot';
-    takeBtn.disabled = vm.running;
-    takeBtn.onclick = function(e) {
-        e.stopPropagation();
-        var defaultName = 'Snapshot ' + (snaps.length + 1);
-        showModal('New Snapshot', 'Create a new snapshot of the base disk. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
-            confirmClass: 'primary',
-            input: { label: 'Snapshot name:', value: defaultName }
+    function addChoice(parent, val, name, meta) {
+        var item = document.createElement('li');
+        var choice = document.createElement('button');
+        choice.type = 'button';
+        choice.className = 'snapshot-choice';
+        choice.value = val;
+        choice.setAttribute('aria-pressed', String(selectedRow === val));
+        choice.disabled = disabled;
+        choice.onclick = function() {
+            snapshotModal.selectedValue = val;
+            selectedSnap.set(vm.name, vm.hasSnapshots ? val : 'current');
+            document.getElementById('snapshot-warn').textContent = '';
+            renderVmTable();
+        };
+        var text = document.createElement('span');
+        text.className = 'snapshot-name';
+        text.textContent = name + (currentRow === val ? ' (current)' : '') +
+            (snapshotModal.selectedValue === val ? ' (selected)' : '');
+        choice.appendChild(text);
+        if (meta) {
+            var info = document.createElement('span');
+            info.className = 'snapshot-meta';
+            info.textContent = meta;
+            choice.appendChild(info);
+        }
+        item.appendChild(choice);
+        parent.appendChild(item);
+        return item;
+    }
+    function addBranches(parent, branches, prefix) {
+        branches.forEach(function(branch, b) {
+            var meta = branch.date ? 'Modified ' + branch.date : '';
+            if (branch.sizeGb) meta += (meta ? ' · ' : '') + branch.sizeGb + ' GB including parent disks';
+            addChoice(parent, prefix + b, branch.name || 'branch ' + (b + 1), meta);
+        });
+    }
+    var base = addChoice(list, 'base', 'Base', vm.hasSnapshots ? 'New branch on start' : 'Original disk');
+    if (vm.hasSnapshots) {
+        var children = document.createElement('ul');
+        base.appendChild(children);
+        addBranches(children, vm.baseBranches || [], 'base-');
+        (vm.snapshots || []).forEach(function(snap, i) {
+            var item = addChoice(children, String(i), snap.name,
+                (snap.date ? 'Created ' + snap.date + ' · ' : '') + 'New branch on start');
+            var branches = document.createElement('ul');
+            item.appendChild(branches);
+            addBranches(branches, snap.branches || [], i + '-');
+        });
+    }
+    if (focusedValue !== null && !disabled) {
+        var focusChoice = Array.from(tree.querySelectorAll('.snapshot-choice')).find(function(choice) { return choice.value === focusedValue; });
+        (focusChoice || tree.querySelector('[aria-pressed="true"]')).focus();
+    }
+    var editable = !!(p.snapshot || p.branch);
+    document.getElementById('btn-snapshot-create').disabled = disabled;
+    document.getElementById('btn-snapshot-rename').disabled = disabled || !editable;
+    document.getElementById('btn-snapshot-delete').disabled = disabled || !editable;
+}
+
+function snapshotActionContext() {
+    if (!snapshotModal) return null;
+    var vm = vms[vmIndexByName(snapshotModal.name)];
+    if (!vm || vm.running || vm.buildingVhdx) return null;
+    return { modal: snapshotModal, name: vm.name, value: selectedSnap.get(vm.name) || 'current',
+        tree: snapshotTreeSignature(vm), vm: vm };
+}
+
+function snapshotActionIndex(context) {
+    if (snapshotModal !== context.modal) return -1;
+    var idx = vmIndexByName(context.name);
+    var vm = vms[idx];
+    if (!vm || vm.running || vm.buildingVhdx) return -1;
+    if (context.tree !== snapshotTreeSignature(vm)) {
+        document.getElementById('snapshot-warn').textContent = 'Snapshots changed. Select the disk again.';
+        return -1;
+    }
+    return idx;
+}
+
+function takeSnapshot() {
+    var context = snapshotActionContext();
+    if (!context) return;
+    showModal('New Snapshot', 'Create a new snapshot of the base disk. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
+        confirmClass: 'primary',
+        input: { label: 'Snapshot name:', value: 'Snapshot ' + ((context.vm.snapshots || []).length + 1) }
+    }).then(function(result) {
+        if (result === false) return;
+        var idx = snapshotActionIndex(context);
+        if (idx >= 0) sendCmd('snapTake', { vmIndex: idx, name: result });
+    });
+}
+
+function renameSnapshot() {
+    var context = snapshotActionContext();
+    if (!context) return;
+    var p = snapshotSelection(context.vm, context.value);
+    var target = p.branch || p.snapshot;
+    if (!target) return;
+    showModal('Rename', 'Enter a new name:', 'Rename', {
+        confirmClass: 'primary',
+        input: { label: 'Name:', value: target.name || '' }
+    }).then(function(result) {
+        if (result === false || result === target.name) return;
+        var idx = snapshotActionIndex(context);
+        if (idx < 0) return;
+        var cmd = { vmIndex: idx, snapIndex: p.snapIndex, name: result };
+        if (p.branchIndex >= 0) cmd.branchIndex = p.branchIndex;
+        sendCmd('snapRename', cmd);
+    });
+}
+
+function deleteSnapshot() {
+    var context = snapshotActionContext();
+    if (!context) return;
+    var p = snapshotSelection(context.vm, context.value);
+    var target = p.branch || p.snapshot;
+    if (!target) return;
+    showModal(p.branch ? 'Delete Branch' : 'Delete Snapshot',
+        p.branch ? 'Delete branch "' + (target.name || '') + '"? Its parent disk will be kept.'
+            : 'Delete snapshot "' + target.name + '" and all its branches?', 'Delete'
+    ).then(function(confirmed) {
+        if (!confirmed) return;
+        var idx = snapshotActionIndex(context);
+        if (idx < 0) return;
+        selectedSnap.delete(context.name);
+        if (p.branch) sendCmd('snapDeleteBranch', { vmIndex: idx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
+        else sendCmd('snapDelete', { vmIndex: idx, snapIndex: p.snapIndex });
+    });
+}
+
+function onStartVm(idx) {
+    var vm = vms[idx];
+    if (!vm || vm.running || vm.buildingVhdx) return;
+    var name = vm.name;
+    var p = parseSnapValue(selectedSnap.get(name) || 'current');
+    if ((p.snapIndex >= 0 || p.snapIndex === -2) && p.branchIndex < 0) {
+        var tree = snapshotTreeSignature(vm);
+        var parentName = p.snapIndex === -2 ? 'Base' : vm.snapshots[p.snapIndex].name;
+        var now = new Date();
+        var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
+        var defaultName = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+        showModal('New Branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the base snapshot.', 'Boot', {
+            confirmClass: 'primary', input: { label: 'Branch name:', value: defaultName }
         }).then(function(result) {
             if (result === false) return;
-            sendCmd('snapTake', { vmIndex: vmIdx, name: result });
-        });
-    };
-    td.appendChild(takeBtn);
-
-    /* Delete button — context-sensitive */
-    var parsed = parseSnapValue(sel);
-    if (!vm.running && parsed.snapIndex >= 0) {
-        var delBtn = document.createElement('button');
-        delBtn.className = 'snap-btn danger';
-        delBtn.textContent = '\u2715';
-
-        if (parsed.branchIndex >= 0) {
-            /* Delete a single branch */
-            delBtn.title = 'Delete branch';
-            delBtn.onclick = function(e) {
-                e.stopPropagation();
-                showModal('Delete Branch',
-                    'Delete this branch? The snapshot will be kept.',
-                    'Delete'
-                ).then(function(confirmed) {
-                    if (confirmed) {
-                        sendCmd('snapDeleteBranch', { vmIndex: vmIdx, snapIndex: parsed.snapIndex, branchIndex: parsed.branchIndex });
-                        selectedSnap[vmIdx] = 'current';
-                    }
-                });
-            };
-        } else {
-            /* Delete entire snapshot + all branches */
-            delBtn.title = 'Delete snapshot';
-            delBtn.onclick = function(e) {
-                e.stopPropagation();
-                var snapName = snaps[parsed.snapIndex] ? snaps[parsed.snapIndex].name : '';
-                showModal('Delete Snapshot',
-                    'Delete snapshot "' + snapName + '" and all its branches?',
-                    'Delete'
-                ).then(function(confirmed) {
-                    if (confirmed) {
-                        sendCmd('snapDelete', { vmIndex: vmIdx, snapIndex: parsed.snapIndex });
-                        selectedSnap[vmIdx] = 'current';
-                    }
-                });
-            };
-        }
-        td.appendChild(delBtn);
-    }
-
-    /* Delete button for base branches */
-    if (!vm.running && parsed.snapIndex === -2 && parsed.branchIndex >= 0) {
-        var delBrBtn = document.createElement('button');
-        delBrBtn.className = 'snap-btn danger';
-        delBrBtn.textContent = '\u2715';
-        delBrBtn.title = 'Delete base branch';
-        delBrBtn.onclick = function(e) {
-            e.stopPropagation();
-            showModal('Delete Branch',
-                'Delete this base branch?',
-                'Delete'
-            ).then(function(confirmed) {
-                if (confirmed) {
-                    sendCmd('snapDeleteBranch', { vmIndex: vmIdx, snapIndex: -2, branchIndex: parsed.branchIndex });
-                    selectedSnap[vmIdx] = 'current';
-                }
-            });
-        };
-        td.appendChild(delBrBtn);
-    }
-
-    /* Rename button — when a snapshot or branch is selected */
-    if (!vm.running && parsed.snapIndex !== -1) {
-        var currentName = '';
-        if (parsed.snapIndex === -2 && parsed.branchIndex >= 0 && baseBranches[parsed.branchIndex]) {
-            currentName = baseBranches[parsed.branchIndex].name || '';
-        } else if (parsed.snapIndex >= 0 && snaps[parsed.snapIndex]) {
-            if (parsed.branchIndex >= 0) {
-                var br = snaps[parsed.snapIndex].branches && snaps[parsed.snapIndex].branches[parsed.branchIndex];
-                currentName = br ? br.name || '' : '';
-            } else {
-                currentName = snaps[parsed.snapIndex].name || '';
+            var currentIdx = vmIndexByName(name);
+            var current = vms[currentIdx];
+            if (!current || current.running || current.buildingVhdx) return;
+            if (tree !== snapshotTreeSignature(current)) {
+                showModal('Snapshots Changed', 'Select the disk again before starting the VM.', 'OK', { confirmClass: 'primary' });
+                return;
             }
-        }
-        if (currentName || parsed.snapIndex >= 0) {
-            var renBtn = document.createElement('button');
-            renBtn.className = 'snap-btn';
-            renBtn.textContent = '\u270F';
-            renBtn.title = 'Rename';
-            renBtn.onclick = function(e) {
-                e.stopPropagation();
-                showModal('Rename', 'Enter a new name:', 'Rename', {
-                    confirmClass: 'primary',
-                    input: { label: 'Name:', value: currentName }
-                }).then(function(result) {
-                    if (result === false || result === currentName) return;
-                    var cmd = { vmIndex: vmIdx, snapIndex: parsed.snapIndex, name: result };
-                    if (parsed.branchIndex >= 0) cmd.branchIndex = parsed.branchIndex;
-                    sendCmd('snapRename', cmd);
-                });
-            };
-            td.appendChild(renBtn);
-        }
+            selectedSnap.delete(name);
+            sendCmd('startVm', { vmIndex: currentIdx, snapIndex: p.snapIndex, branchIndex: p.branchIndex, branchName: result });
+        });
+    } else {
+        sendCmd('startVm', { vmIndex: idx, snapIndex: p.snapIndex, branchIndex: p.branchIndex });
     }
-
-    return td;
 }
 
 /* ---- Log ---- */
@@ -1656,7 +1690,13 @@ function showModal(title, message, confirmText, opts) {
 function modalResolve(result) {
     document.getElementById('modal-overlay').classList.remove('active');
     if (pendingConfirm) {
-        if (pendingConfirm.previousFocus) pendingConfirm.previousFocus.focus();
+        if (pendingConfirm.previousFocus && pendingConfirm.previousFocus.isConnected) {
+            pendingConfirm.previousFocus.focus();
+        } else if (snapshotModal) {
+            document.querySelector('#snapshot-overlay .modal-buttons button:last-child').focus();
+        } else if (editVmState) {
+            document.getElementById('btn-save-edit-vm').focus();
+        }
         if (result && pendingConfirm.hasInput) {
             pendingConfirm.resolve(document.getElementById('modal-input').value);
         } else {

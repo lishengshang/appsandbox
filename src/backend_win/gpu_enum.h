@@ -51,7 +51,9 @@ BOOL gpu_get_default_driver_path(GpuList *list,
 BOOL gpu_get_driver_shares(GpuList *gpu_list, GpuDriverShareList *out);
 
 /* Windows guests only; callers gate on guest OS and GPU mode. */
+BOOL gpu_append_amd_gl_vk_driver_shares(const GpuList *gpu_list, GpuDriverShareList *list);
 BOOL gpu_append_nvidia_drs_share(const GpuList *gpu_list, GpuDriverShareList *list);
+BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverShareList *list);
 
 /* Append the host's lxss\lib directory as a synthetic Plan9 share entry
    (name "AppSandbox.HostLxssLib") to a share list. Linux guests need

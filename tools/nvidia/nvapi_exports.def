@@ -1,0 +1,3 @@
+EXPORTS
+    nvapi_QueryInterface
+    appsandbox_nvapi

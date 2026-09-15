@@ -118,6 +118,7 @@ typedef struct {
     /* For regular files, set by the walker, used by the callback to fetch
      * the bytes (deferred so the callback can stream / skip as needed). */
     uint64_t       _file_inode_off; /* internal: offset of file's inode in table */
+    uint32_t       _xattr_idx;
 } sqfs_entry_t;
 
 /* Callback signature. Return 0 to continue, non-zero to abort traversal. */
@@ -134,5 +135,8 @@ int sqfs_walk(sqfs_ctx_t *ctx, sqfs_walk_cb_t cb, void *user);
  * files we can't fit. For now, simple bulk read. */
 int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
                    void **out_data, size_t *out_size);
+
+int sqfs_read_capability(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
+                         void **out_data, size_t *out_size);
 
 #endif

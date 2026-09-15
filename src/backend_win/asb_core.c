@@ -89,38 +89,6 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
         CopyFileW(src, dst, FALSE);  /* best-effort; trio may not be staged yet */
     }
 
-    /* NVAPI forwarding proxy for GPU-PV guests (tools/nvapi-proxy). It rides the
-     * same share; the agent deploys it over System32\nvapi64.dll only when an
-     * NVIDIA driver was copied into the guest — without it NGX/DLSS refuses to
-     * initialise in a paravirtualized guest. See nvapi_proxy_provision(). */
-    swprintf_s(res, MAX_PATH, L"%s\\resources\\nvapi-proxy", exe);
-    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
-        swprintf_s(res, MAX_PATH, L"%s\\nvapi-proxy", exe);
-    swprintf_s(src, MAX_PATH, L"%s\\nvapi64.dll", res);
-    swprintf_s(dst, MAX_PATH, L"%s\\nvapi64_proxy.dll", dir);
-    CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the proxy */
-
-    /* Native Vulkan ICD shim for NVIDIA GPU-PV guests (tools/nvvk-shim). Rides
-     * the same share; the agent drops it next to nvoglv64.dll in the guest's
-     * HostDriverStore and points nv-vk64.json at it, so Vulkan games get
-     * NVIDIA's driver instead of Mesa's Vulkan-on-D3D12. See nvvk_shim_provision(). */
-    swprintf_s(res, MAX_PATH, L"%s\\resources\\nvvk-shim", exe);
-    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
-        swprintf_s(res, MAX_PATH, L"%s\\nvvk-shim", exe);
-    swprintf_s(src, MAX_PATH, L"%s\\asb_nvvk.dll", res);
-    swprintf_s(dst, MAX_PATH, L"%s\\asb_nvvk.dll", dir);
-    CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the shim */
-    /* Native OpenGL wrapper for NVIDIA GPU-PV guests (tools/nvgl-wrapper). Rides
-     * the same share; the agent installs it as System32\opengl32.dll over
-     * Microsoft's (kept beside it as asb_gl_ms.dll) so OpenGL apps get NVIDIA's
-     * own ICD instead of Mesa's OpenGL-on-D3D12. See gl_provision() in the agent. */
-    swprintf_s(res, MAX_PATH, L"%s\\resources\\nvgl-wrapper", exe);
-    if (GetFileAttributesW(res) == INVALID_FILE_ATTRIBUTES)
-        swprintf_s(res, MAX_PATH, L"%s\\nvgl-wrapper", exe);
-    swprintf_s(src, MAX_PATH, L"%s\\asb_opengl32.dll", res);
-    swprintf_s(dst, MAX_PATH, L"%s\\asb_opengl32.dll", dir);
-    CopyFileW(src, dst, FALSE);  /* best-effort; absent on builds without the wrapper */
-
     gpu_append_gl_layers_share(shares, dir);
 }
 
@@ -1084,7 +1052,9 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         if (_wcsicmp(args->config.os_type, L"Linux") == 0)
             gpu_append_lxsslib_share(&args->config.gpu_shares);
         else if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
+            gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &args->config.gpu_shares);
             gpu_append_nvidia_drs_share(&g_gpu_list, &args->config.gpu_shares);
+            gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &args->config.gpu_shares);
             prepare_gl_layers_share(&args->config.gpu_shares);
         }
     }
@@ -2006,7 +1976,8 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
  * Output buffers should be at least 64 wchars each. */
 static int detect_iso_kernel(const wchar_t *iso_path,
                              wchar_t *codename_out, size_t codename_cap,
-                             wchar_t *kver_out, size_t kver_cap)
+                             wchar_t *kver_out, size_t kver_cap,
+                             HANDLE *iso_out, wchar_t *drive_out)
 {
     HANDLE iso_handle = INVALID_HANDLE_VALUE;
     DWORD cdrom_before, cdrom_after, newly;
@@ -2015,6 +1986,8 @@ static int detect_iso_kernel(const wchar_t *iso_path,
 
     codename_out[0] = 0;
     kver_out[0]     = 0;
+    *iso_out = INVALID_HANDLE_VALUE;
+    *drive_out = 0;
 
     /* Snapshot current CD-ROM drive letters before mount. */
     cdrom_before = 0;
@@ -2163,6 +2136,9 @@ static int detect_iso_kernel(const wchar_t *iso_path,
     }
 
     asb_log(L"detect_iso_kernel: codename=%s kver=%s", codename_out, kver_out);
+    *iso_out = iso_handle;
+    *drive_out = iso_drive;
+    iso_handle = INVALID_HANDLE_VALUE;
     rc = 0;
 
 cleanup:
@@ -2437,9 +2413,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            direct routes). */
         asb_log(L"Prefetch 2/3: apt build-deps closure...");
         wchar_t codename[64] = L"", kver[64] = L"";
+        HANDLE iso_handle = INVALID_HANDLE_VALUE;
+        wchar_t iso_drive = 0;
         if (detect_iso_kernel(args->config.image_path,
                               codename, ARRAYSIZE(codename),
-                              kver,     ARRAYSIZE(kver)) != 0) {
+                              kver,     ARRAYSIZE(kver),
+                              &iso_handle, &iso_drive) != 0) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
                       L"Could not detect the ISO's codename/kernel for the apt prefetch.");
@@ -2450,8 +2429,8 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
             swprintf_s(apt_out, MAX_PATH, L"%s\\local-apt-extras", extras);
             swprintf_s(args_buf, 2048,
                 L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
-                L"--out-dir \"%s\"",
-                codename, kver, apt_out);
+                L"--out-dir \"%s\" --iso-root \"%c:\"",
+                codename, kver, apt_out, iso_drive);
             wchar_t mirror[512];
             DWORD mn = GetEnvironmentVariableW(L"ASB_APT_MIRROR", mirror, 512);
             if (mn > 0 && mn < 512) {
@@ -2460,10 +2439,13 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                 wcscat_s(args_buf, 2048, tail);
                 asb_log(L"Using apt mirror from ASB_APT_MIRROR: %s", mirror);
             }
-            /* Fatal, same rationale as Prefetch 1: without the offline
-               apt closure the firstboot cannot install gcc/dkms, the
-               agent never builds, and install never completes. */
-            if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            int prefetch_rc = spawn_iso_patch_prefetch(args_buf);
+            DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+            CloseHandle(iso_handle);
+            /* Fatal, same rationale as Prefetch 1: without the offline apt
+               closure the firstboot cannot install gcc/dkms, the agent never
+               builds, and install never completes. */
+            if (prefetch_rc != 0) {
                 asb_log(L"Error: prefetch-build-deps failed.");
                 args->result = E_FAIL;
                 wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
@@ -3270,7 +3252,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         if (_wcsicmp(cfg.os_type, L"Linux") == 0)
             gpu_append_lxsslib_share(&cfg.gpu_shares);
         else if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
+            gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &cfg.gpu_shares);
             gpu_append_nvidia_drs_share(&g_gpu_list, &cfg.gpu_shares);
+            gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &cfg.gpu_shares);
             prepare_gl_layers_share(&cfg.gpu_shares);
         }
     }
