@@ -10,6 +10,7 @@ tools/vdd/certs/
 
 # Claude
 .claude/
+.workbuddy/
 
 # macOS Finder metadata
 .DS_Store
